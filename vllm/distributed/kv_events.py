@@ -338,7 +338,6 @@ class ZmqEventPublisher(EventPublisher):
 
 class EventPublisherFactory:
     _registry: dict[str, Callable[..., EventPublisher]] = {
-        "null": NullEventPublisher,
         "zmq": ZmqEventPublisher,
     }
 
@@ -351,10 +350,14 @@ class EventPublisherFactory:
     @classmethod
     def create(
         cls, config: KVEventsConfig | None, data_parallel_rank: int = 0
-    ) -> EventPublisher:
+    ) -> EventPublisher | None:
         """Create publisher from a config mapping."""
-        if config is None or config.publisher == "null":
-            return NullEventPublisher()
+        if (
+            not config
+            or not config.enable_kv_cache_events
+            or config.publisher == "null"
+        ):
+            return None
 
         config_dict = asdict(config)
 
