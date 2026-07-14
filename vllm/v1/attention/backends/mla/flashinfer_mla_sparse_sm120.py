@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.v1.attention.backend import (
     AttentionLayer,
     AttentionType,
@@ -14,6 +15,9 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseMetadata,
     _get_workspace_buffer,
+)
+from vllm.v1.attention.backends.mla.page_offload.coordinator import (
+    maybe_create_sparse_page_offload_coordinator,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
@@ -101,6 +105,11 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
 
         self.supports_quant_query_input = False
         self._workspace_buffer: torch.Tensor | None = None
+        self.sparse_page_offload_coordinator = (
+            maybe_create_sparse_page_offload_coordinator(
+                get_current_vllm_config_or_none()
+            )
+        )
 
     def forward_mqa(
         self,
@@ -116,6 +125,15 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+
+        if self.sparse_page_offload_coordinator is not None:
+            self.sparse_page_offload_coordinator.observe_layer(
+                layer_name=getattr(layer, "layer_name", ""),
+                kv_cache_dtype=self.kv_cache_dtype,
+                req_id_per_token=attn_metadata.req_id_per_token[:num_actual_toks],
+                topk_indices=topk_indices,
+                seq_lens=attn_metadata.seq_lens,
+            )
 
         topk_indices_physical = cast(
             torch.Tensor,
