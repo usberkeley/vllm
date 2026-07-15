@@ -479,10 +479,11 @@ KV offload 路径,违反本设计“现有 CPU KV offload 路径不受影响”�
 `--kv-offloading-size`:
 
 ```bash
-vllm serve deepseek-ai/DeepSeek-V4 \
-    --tensor-parallel-size 8 \
+CUDA_VISIBLE_DEVICES=3 vllm serve /data/public_models/Deepseek-V4-Flash \
+    --kv-cache-dtype fp8 \
     --trust-remote-code \
     --max-model-len 262144 \
+    --port 8003 \
     --hf-overrides '{"sparse_page_offload": true, "sparse_page_cpu_pool_size_gib": 128, "sparse_page_transfer_backend": "native_cpu", "sparse_page_hot_pool_blocks": 512, "sparse_page_prefetch_lookahead": 2, "sparse_page_offload_layers": "auto"}'
 ```
 

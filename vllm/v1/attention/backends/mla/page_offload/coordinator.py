@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.page_offload.adapters.deepseek_v4_c4a import (
     DeepSeekV4C4AAdapter,
 )
@@ -22,6 +23,8 @@ from vllm.v1.attention.backends.mla.page_offload.telemetry import (
     SparseSelectionCollector,
     SparseSelectionStats,
 )
+
+logger = init_logger(__name__)
 
 
 class SparsePageOffloadCoordinator:
@@ -68,7 +71,19 @@ class SparsePageOffloadCoordinator:
             topk_indices=topk_indices,
             seq_lens=seq_lens,
         )
-        return self.collector.record(layer_name, selection)
+        stats = self.collector.record(layer_name, selection)
+        logger.info(
+            "Sparse page observe-only stats: layer=%s step=%d "
+            "unique_pages=%d tail_pages=%d simulated_miss_pages=%s "
+            "estimated_bytes=%s",
+            stats.layer_name,
+            stats.step,
+            stats.num_unique_pages,
+            stats.num_tail_pages,
+            stats.simulated_miss_pages,
+            stats.estimated_bytes,
+        )
+        return stats
 
 
 def maybe_create_sparse_page_offload_coordinator(
