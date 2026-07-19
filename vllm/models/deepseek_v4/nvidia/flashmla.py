@@ -163,15 +163,32 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
             if self.compress_ratio == 4:
                 # C4A: local indices differ per layer (filled by Indexer).
+                assert kv_cache is not None
                 assert self.topk_indices_buffer is not None
+                assert swa_metadata.seq_lens is not None
+                assert swa_metadata.token_to_req_indices is not None
+                block_table = attn_metadata.block_table[:num_decodes]
+                offload_result = self.prepare_sparse_page_offload(
+                    req_id_per_token=swa_metadata.token_to_req_indices[
+                        :num_decode_tokens
+                    ],
+                    topk_indices=self.topk_indices_buffer[:num_decode_tokens],
+                    seq_lens=swa_metadata.seq_lens,
+                    kv_cache=kv_cache,
+                    source_block_table=block_table,
+                    is_decode_only=(
+                        num_decode_tokens == num_decodes
+                    ),
+                )
                 global_indices, topk_lens = compute_global_topk_indices_and_lens(
                     self.topk_indices_buffer[:num_decode_tokens],
                     swa_metadata.token_to_req_indices,
-                    attn_metadata.block_table[:num_decodes],
+                    offload_result.block_table,
                     block_size,
                     is_valid,
                 )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
+                kv_cache = offload_result.kv_cache
             else:
                 # C128A: pre-computed during metadata build.
                 topk_indices = attn_metadata.c128a_global_decode_topk_indices
@@ -261,6 +278,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         query_start_loc = swa_metadata.query_start_loc
         assert query_start_loc_cpu is not None
         assert query_start_loc is not None
+        num_prefills = swa_metadata.num_prefills
         prefill_token_base = query_start_loc_cpu[num_decodes]
 
         if not swa_only:
@@ -344,4 +362,22 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 attn_sink=self.attn_sink,
                 topk_length=combined_lens,
                 out=output[query_start:query_end],
+            )
+
+        if (
+            not swa_only
+            and self.compress_ratio == 4
+            and num_decodes == 0  # only for PD 分离
+            and num_prefills > 0
+            and num_prefill_tokens > 0
+        ):
+            assert compressed_k_cache is not None
+            assert attn_metadata is not None
+            assert swa_metadata.token_to_req_indices is not None
+            last_positions = query_start_loc[1 : num_prefills + 1].to(torch.long) - 1
+            self.seal_sparse_page_prefill_offload(
+                req_id_per_token=swa_metadata.token_to_req_indices[last_positions],
+                seq_lens=seq_lens,
+                kv_cache=compressed_k_cache,
+                source_block_table=attn_metadata.block_table[:num_prefills],
             )

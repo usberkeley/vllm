@@ -982,6 +982,11 @@ def _pool_bytes_per_block(
     if _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # buckets = {page_size: [[layer_names], [layer_names], ...]}
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
+        sparse_config, sparse_layers = _get_sparse_c4a_page_sizes(
+            vllm_config, kv_cache_groups
+        )
+        if sparse_config.allocate_partial:
+            return _packed_bytes_per_block(buckets, sparse_layers)
         return sum(ps * len(slots) for ps, slots in buckets.items())
     group_size = max(len(g.layer_names) for g in kv_cache_groups)
     page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
@@ -1282,6 +1287,63 @@ def _bucket_layers_by_page_size(
     return buckets
 
 
+def _get_sparse_c4a_page_sizes(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[Any, dict[str, int]]:
+    from vllm.v1.attention.backends.mla.page_offload.config import (
+        SparsePageOffloadConfig,
+    )
+
+    sparse_config = SparsePageOffloadConfig.from_kv_transfer_config(
+        getattr(vllm_config, "kv_transfer_config", None)
+    )
+    sparse_layers: dict[str, int] = {}
+    if not sparse_config.enabled:
+        return sparse_config, sparse_layers
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        if not isinstance(group_spec, UniformTypeKVCacheSpecs):
+            continue
+        for layer_name, layer_spec in group_spec.kv_cache_specs.items():
+            if (
+                isinstance(layer_spec, MLAAttentionSpec)
+                and layer_spec.model_version == "deepseek_v4"
+                and layer_spec.compress_ratio == 4
+                and layer_spec.cache_dtype_str == "fp8_ds_mla"
+                and sparse_config.includes_layer(layer_name)
+            ):
+                sparse_layers[layer_name] = layer_spec.page_size_bytes
+    return sparse_config, sparse_layers
+
+
+def _packed_bytes_per_block(
+    buckets: dict[int, list[list[str]]],
+    excluded_layers: dict[str, int],
+) -> int:
+    return sum(
+        page_size
+        for page_size, slots in buckets.items()
+        for slot in slots
+        if any(layer not in excluded_layers for layer in slot)
+    )
+
+
+def _sparse_fixed_pool_bytes(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    sparse_config, sparse_layers = _get_sparse_c4a_page_sizes(
+        vllm_config, kv_cache_groups
+    )
+    if not sparse_config.allocate_partial:
+        return 0
+    pool_blocks = vllm_config.scheduler_config.max_num_seqs * (
+        sparse_config.hot_pages_per_request + 1
+    )
+    return pool_blocks * sum(sparse_layers.values())
+
+
 def _use_packed_kv_cache_config(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1316,11 +1378,52 @@ def _get_kv_cache_config_packed(
     tables so block-id namespaces never collide). Each emitted tensor aliases
     one physical backing allocation, with per-block data laid out contiguously.
     """
+    sparse_config, sparse_layers = _get_sparse_c4a_page_sizes(
+        vllm_config, kv_cache_groups
+    )
+
     # buckets = {page_size: [[layer_names], [layer_names], ...]}
     buckets = _bucket_layers_by_page_size(kv_cache_groups)
+    if sparse_layers:
+        buckets = {
+            page_size: [
+                [layer for layer in slot if layer not in sparse_layers]
+                for slot in slots
+            ]
+            for page_size, slots in buckets.items()
+        }
+        buckets = {
+            page_size: [slot for slot in slots if slot]
+            for page_size, slots in buckets.items()
+            if any(slots)
+        }
     total_num_bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+    if total_num_bytes_per_block <= 0:
+        raise ValueError("Packed KV cache has no non-sparse layers to allocate.")
 
-    num_blocks = available_memory // total_num_bytes_per_block
+    sparse_fixed_bytes = 0
+    sparse_bytes_per_block = sum(sparse_layers.values())
+    if sparse_config.allocate_partial:
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        sparse_pool_blocks = max_num_seqs * (
+            sparse_config.hot_pages_per_request + 1
+        )
+        sparse_fixed_bytes = sparse_pool_blocks * sparse_bytes_per_block
+        if sparse_fixed_bytes >= available_memory:
+            raise MemoryError(
+                "Sparse c4a partial pools exceed available KV cache memory: "
+                f"requested={sparse_fixed_bytes} available={available_memory}."
+            )
+        allocatable_memory = available_memory - sparse_fixed_bytes
+        bytes_per_scalable_block = total_num_bytes_per_block
+    else:
+        sparse_pool_blocks = 0
+        allocatable_memory = available_memory
+        bytes_per_scalable_block = (
+            total_num_bytes_per_block + sparse_bytes_per_block
+        )
+
+    num_blocks = allocatable_memory // bytes_per_scalable_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     total_size = total_num_bytes_per_block * num_blocks
@@ -1338,6 +1441,15 @@ def _get_kv_cache_config_packed(
                 )
             )
             byte_offset += ps
+
+    sparse_num_blocks = sparse_pool_blocks or num_blocks
+    for layer_name, page_size in sparse_layers.items():
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=page_size * sparse_num_blocks,
+                shared_by=[layer_name],
+            )
+        )
 
     return num_blocks, kv_cache_tensors
 
@@ -1368,8 +1480,13 @@ def get_kv_cache_config_from_groups(
         )
 
     # Determine how model runners should initialize the KV cache tensors.
-    if len(kv_cache_groups) == 1 and isinstance(
-        kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+    _, sparse_layers = _get_sparse_c4a_page_sizes(vllm_config, kv_cache_groups)
+    if (
+        len(kv_cache_groups) == 1
+        and isinstance(
+            kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+        )
+        and not sparse_layers
     ):
         # Special case: all layers have the same type of KV cache but with
         # different hidden sizes. Allocate different amount of memory for each
@@ -1849,9 +1966,14 @@ def _max_memory_usage_bytes_from_groups(
     ):
         # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
-        return sum(
+        full_memory = sum(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
+        )
+        return _adjust_memory_for_sparse_partial(
+            vllm_config,
+            kv_cache_groups,
+            full_memory,
         )
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
@@ -1877,7 +1999,11 @@ def _max_memory_usage_bytes_from_groups(
                 num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
-        return total_max_mem_usage_bytes
+        return _adjust_memory_for_sparse_partial(
+            vllm_config,
+            kv_cache_groups,
+            total_max_mem_usage_bytes,
+        )
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
@@ -1891,6 +2017,28 @@ def _max_memory_usage_bytes_from_groups(
     )
 
     return group_size * page_size * blocks_needed
+
+
+def _adjust_memory_for_sparse_partial(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    full_memory_bytes: int,
+) -> int:
+    sparse_config, sparse_layers = _get_sparse_c4a_page_sizes(
+        vllm_config, kv_cache_groups
+    )
+    if not sparse_config.allocate_partial or not sparse_layers:
+        return full_memory_bytes
+    buckets = _bucket_layers_by_page_size(kv_cache_groups)
+    full_bytes_per_block = sum(
+        page_size * len(slots) for page_size, slots in buckets.items()
+    )
+    regular_bytes_per_block = _packed_bytes_per_block(buckets, sparse_layers)
+    required_blocks = cdiv(full_memory_bytes, full_bytes_per_block)
+    return (
+        required_blocks * regular_bytes_per_block
+        + _sparse_fixed_pool_bytes(vllm_config, kv_cache_groups)
+    )
 
 
 def _estimate_max_model_len_from_groups(
@@ -2118,7 +2266,10 @@ def get_kv_cache_configs(
                 avail_mem // bytes_per_block,
                 override,
             )
-            adjusted_memory.append(override * bytes_per_block)
+            adjusted_memory.append(
+                override * bytes_per_block
+                + _sparse_fixed_pool_bytes(vllm_config, groups)
+            )
         available_memory = adjusted_memory
 
     if vllm_config.model_config.original_max_model_len == -1:
@@ -2159,9 +2310,17 @@ def get_kv_cache_configs(
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
+        sparse_config, sparse_layers = _get_sparse_c4a_page_sizes(
+            vllm_config, kv_cache_config.kv_cache_groups
+        )
+        fixed_sparse_layers = (
+            sparse_layers if sparse_config.allocate_partial else {}
+        )
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
+            if any(layer in fixed_sparse_layers for layer in tensor.shared_by):
+                continue
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
 

@@ -544,6 +544,17 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    @property
+    def requires_connector_output_before_request_finished(self) -> bool:
+        """Whether worker output must be consumed before request_finished().
+
+        Most connectors can update scheduler-side state after request outputs are
+        processed. Connectors that return current-step sideband from
+        request_finished() can opt in so the scheduler consumes worker metadata
+        first.
+        """
+        return False
+
     def request_finished(
         self,
         request: "Request",

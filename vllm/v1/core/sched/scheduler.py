@@ -1567,6 +1567,15 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
             )
 
+        kv_connector_output_updated = False
+        if (
+            kv_connector_output
+            and self.connector is not None
+            and self.connector.requires_connector_output_before_request_finished
+        ):
+            self.connector.update_connector_output(kv_connector_output)
+            kv_connector_output_updated = True
+
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
         # MUST precede the per-request routing reads below: stopped
@@ -1818,7 +1827,10 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
-            self._update_from_kv_xfer_finished(kv_connector_output)
+            self._update_from_kv_xfer_finished(
+                kv_connector_output,
+                update_connector=not kv_connector_output_updated,
+            )
 
         # Worker-side KV connector stats from the model runner output.
         kv_connector_stats: KVConnectorStats | None = (
@@ -2538,7 +2550,11 @@ class Scheduler(SchedulerInterface):
             f"{request.status.name} for request {request.request_id}"
         )
 
-    def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
+    def _update_from_kv_xfer_finished(
+        self,
+        kv_connector_output: KVConnectorOutput,
+        update_connector: bool = True,
+    ):
         """
         KV Connector: update the scheduler state based on the output.
 
@@ -2549,7 +2565,7 @@ class Scheduler(SchedulerInterface):
             schedule the request during the next step.
         """
 
-        if self.connector is not None:
+        if update_connector and self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
 
         # KV Connector:: update recv and send status from last step.

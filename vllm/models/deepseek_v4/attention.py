@@ -55,6 +55,12 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     get_max_prefill_buffer_size,
 )
+from vllm.v1.attention.backends.mla.page_offload.coordinator import (
+    get_sparse_page_offload_coordinator,
+)
+from vllm.v1.attention.backends.mla.page_offload.staging import (
+    SparsePageStagingResult,
+)
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -290,6 +296,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
             self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
         )
+        # Shared per VllmConfig so telemetry and hot-pool state span all
+        # sparse layers.
+        self.sparse_page_offload_coordinator = get_sparse_page_offload_coordinator(
+            vllm_config
+        )
 
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
@@ -320,6 +331,52 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.prefix,
             )
+
+    def prepare_sparse_page_offload(
+        self,
+        *,
+        req_id_per_token: torch.Tensor,
+        topk_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_cache: torch.Tensor,
+        source_block_table: torch.Tensor,
+        is_decode_only: bool,
+    ) -> SparsePageStagingResult:
+        if self.sparse_page_offload_coordinator is None:
+            return SparsePageStagingResult(
+                kv_cache=kv_cache,
+                block_table=source_block_table,
+                enabled=False,
+            )
+        return self.sparse_page_offload_coordinator.stage_decode_layer(
+            layer_name=self.prefix,
+            kv_cache_dtype=self.kv_cache_dtype,
+            req_id_per_token=req_id_per_token,
+            topk_indices=topk_indices,
+            seq_lens=seq_lens,
+            kv_cache=kv_cache,
+            source_block_table=source_block_table,
+            is_decode_only=is_decode_only,
+        )
+
+    def seal_sparse_page_prefill_offload(
+        self,
+        *,
+        req_id_per_token: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_cache: torch.Tensor,
+        source_block_table: torch.Tensor,
+    ) -> None:
+        if self.sparse_page_offload_coordinator is None:
+            return
+        self.sparse_page_offload_coordinator.seal_prefill_request(
+            layer_name=self.prefix,
+            kv_cache_dtype=self.kv_cache_dtype,
+            req_id_per_token=req_id_per_token,
+            seq_lens=seq_lens,
+            kv_cache=kv_cache,
+            source_block_table=source_block_table,
+        )
 
     def forward(
         self,

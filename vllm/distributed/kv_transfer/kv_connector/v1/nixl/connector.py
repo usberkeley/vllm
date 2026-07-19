@@ -322,6 +322,9 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
 class NixlPullConnector(NixlBaseConnector):
     """Pull-based (READ) NIXL KV transfer connector."""
 
+    scheduler_cls = NixlPullConnectorScheduler
+    worker_cls = NixlPullConnectorWorker
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -330,13 +333,13 @@ class NixlPullConnector(NixlBaseConnector):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = NixlPullConnectorScheduler(
+            self.connector_scheduler = self.scheduler_cls(
                 vllm_config, self.engine_id, kv_cache_config
             )
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
-            self.connector_worker = NixlPullConnectorWorker(
+            self.connector_worker = self.worker_cls(
                 vllm_config, self.engine_id, kv_cache_config
             )
 

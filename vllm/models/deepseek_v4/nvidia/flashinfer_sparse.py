@@ -300,6 +300,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         assert swa_metadata.token_to_req_indices is not None
         assert swa_metadata.decode_swa_indices is not None
         assert swa_metadata.block_table is not None
+        seq_lens = swa_metadata.seq_lens[:num_reqs]
 
         decode_swa_indices = swa_metadata.decode_swa_indices.reshape(
             num_decode_tokens, self.window_size
@@ -327,6 +328,19 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
 
             if self.compress_ratio == 4:
                 assert self.topk_indices_buffer is not None
+                offload_result = self.prepare_sparse_page_offload(
+                    req_id_per_token=swa_metadata.token_to_req_indices[:num_tokens],
+                    topk_indices=self.topk_indices_buffer[:num_tokens],
+                    seq_lens=seq_lens,
+                    kv_cache=compressed_kv_cache,
+                    source_block_table=compressed_block_table,
+                    is_decode_only=(
+                        num_prefill_tokens == 0
+                        and num_decode_tokens == num_decodes
+                    ),
+                )
+                compressed_kv_cache = offload_result.kv_cache
+                compressed_block_table = offload_result.block_table
                 if num_prefill_tokens > 0:
                     prefill_topk_indices = self.topk_indices_buffer[
                         num_decode_tokens:num_tokens
@@ -372,7 +386,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                     decode_compressed_topk_lens = swa_metadata.seq_lens[:0]
 
         query_start_loc = swa_metadata.query_start_loc[: num_reqs + 1]
-        seq_lens = swa_metadata.seq_lens[:num_reqs]
         assert seq_lens.dtype == torch.int32
         # cache for SWA-only and C128A that build the same mixed sparse indices
         # C4A stays uncached.
@@ -523,6 +536,24 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 cum_seq_lens_q=prefill_cu,
                 max_q_len=int(prefill_lens_cpu.max().item()),
             )
+
+            if (
+                not swa_only
+                and self.compress_ratio == 4
+                and num_decodes == 0
+                and num_prefills > 0
+            ):
+                assert attn_metadata is not None
+                assert swa_metadata.token_to_req_indices is not None
+                last_positions = (
+                    query_start_loc[1 : num_prefills + 1].to(torch.long) - 1
+                )
+                self.seal_sparse_page_prefill_offload(
+                    req_id_per_token=swa_metadata.token_to_req_indices[last_positions],
+                    seq_lens=seq_lens,
+                    kv_cache=compressed_kv_cache,
+                    source_block_table=attn_metadata.block_table[:num_prefills],
+                )
 
 
 class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
@@ -740,12 +771,29 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     raise RuntimeError(
                         "C4A decode requires top-k indices from the indexer."
                     )
+                assert kv_cache is not None
+                assert swa_metadata.seq_lens is not None
+                assert swa_metadata.token_to_req_indices is not None
+                block_table = attn_metadata.block_table[:num_decodes]
+                offload_result = self.prepare_sparse_page_offload(
+                    req_id_per_token=swa_metadata.token_to_req_indices[
+                        :num_decode_tokens
+                    ],
+                    topk_indices=self.topk_indices_buffer[:num_decode_tokens],
+                    seq_lens=swa_metadata.seq_lens,
+                    kv_cache=kv_cache,
+                    source_block_table=block_table,
+                    is_decode_only=(
+                        num_decode_tokens == num_decodes
+                    ),
+                )
+                kv_cache = offload_result.kv_cache
                 block_size = attn_metadata.block_size // self.compress_ratio
                 global_indices, extra_sparse_lengths = (
                     compute_global_topk_indices_and_lens(
                         self.topk_indices_buffer[:num_decode_tokens],
                         swa_metadata.token_to_req_indices,
-                        attn_metadata.block_table[:num_decodes],
+                        offload_result.block_table,
                         block_size,
                         is_valid,
                     )
@@ -898,4 +946,26 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 swa_topk_lens=swa_lens_chunk,
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+            )
+
+        if (
+            not swa_only
+            and self.compress_ratio == 4
+            and num_decodes == 0
+            and num_prefills > 0
+            and num_prefill_tokens > 0
+        ):
+            assert compressed_k_cache is not None
+            assert attn_metadata is not None
+            assert swa_metadata.seq_lens is not None
+            assert swa_metadata.token_to_req_indices is not None
+            assert swa_metadata.query_start_loc is not None
+            last_positions = (
+                swa_metadata.query_start_loc[1 : num_prefills + 1].to(torch.long) - 1
+            )
+            self.seal_sparse_page_prefill_offload(
+                req_id_per_token=swa_metadata.token_to_req_indices[last_positions],
+                seq_lens=swa_metadata.seq_lens,
+                kv_cache=compressed_k_cache,
+                source_block_table=attn_metadata.block_table[:num_prefills],
             )

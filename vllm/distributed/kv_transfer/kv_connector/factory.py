@@ -192,6 +192,12 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "SparsePageConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.sparse_page_connector",
+    "SparsePageConnector",
+)
+
+KVConnectorFactory.register_connector(
     "MultiConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector",
     "MultiConnector",

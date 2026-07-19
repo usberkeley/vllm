@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 
 from vllm import envs
-from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonPrefillMetadata
@@ -26,9 +26,6 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MLAAttentionImpl,
     MultipleOf,
-)
-from vllm.v1.attention.backends.mla.page_offload.coordinator import (
-    maybe_create_sparse_page_offload_coordinator,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
@@ -374,11 +371,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         self._workspace_buffer: torch.Tensor | None = None
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
-        self.sparse_page_offload_coordinator = (
-            maybe_create_sparse_page_offload_coordinator(
-                get_current_vllm_config_or_none()
-            )
-        )
 
         # fp8 query quantization is required when using fp8 kv_cache,
         # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
@@ -399,15 +391,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
-
-        if self.sparse_page_offload_coordinator is not None:
-            self.sparse_page_offload_coordinator.observe_layer(
-                layer_name=getattr(layer, "layer_name", ""),
-                kv_cache_dtype=self.kv_cache_dtype,
-                req_id_per_token=attn_metadata.req_id_per_token[:num_actual_toks],
-                topk_indices=topk_indices,
-                seq_lens=attn_metadata.seq_lens,
-            )
 
         if self.dcp_world_size > 1:
             topk_indices_physical, seq_lens = triton_filter_and_convert_dcp_index(

@@ -339,6 +339,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         notified_req_ids: set[str] = set()
         for notifs in self.nixl_wrapper.get_new_notifs().values():
             for notif in notifs:
+                if self._handle_custom_notif(notif):
+                    continue
                 msg = notif.decode("utf-8")
 
                 # Handle heartbeat messages from D-side.
@@ -380,3 +382,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     self._reqs_to_process.remove(req_id)
                     self._reqs_to_send.pop(req_id, None)
         return notified_req_ids
+
+    def _handle_custom_notif(self, notif: bytes) -> bool:
+        """Handle a connector-specific notification before NIXL KV parsing."""
+        return False

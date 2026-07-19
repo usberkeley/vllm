@@ -3,13 +3,14 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import KVTransferConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
@@ -60,6 +61,77 @@ from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_sparse_page_consumer_packed_config_allocates_only_hot_and_tail_c4a():
+    c4a_layer = "model.layers.0.self_attn.attn"
+    c128a_layer = "model.layers.1.self_attn.attn"
+    c4a_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    c128a_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        compress_ratio=128,
+        model_version="deepseek_v4",
+    )
+    group_spec = UniformTypeKVCacheSpecs(
+        block_size=256,
+        kv_cache_specs={c4a_layer: c4a_spec, c128a_layer: c128a_spec},
+    )
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=[c4a_layer, c128a_layer],
+            kv_cache_spec=group_spec,
+        )
+    ]
+    hot_pages_per_request = 2
+    max_num_seqs = 2
+    partial_blocks = max_num_seqs * (hot_pages_per_request + 1)
+    scalable_blocks = 10
+    available_memory = (
+        partial_blocks * c4a_spec.page_size_bytes
+        + scalable_blocks * c128a_spec.page_size_bytes
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="SparsePageConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={
+                "sparse_page_hot_pool_blocks": hot_pages_per_request
+            },
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+    )
+
+    num_blocks, tensors = kv_cache_utils._get_kv_cache_config_packed(
+        config,
+        groups,
+        available_memory,
+    )
+
+    assert num_blocks == scalable_blocks
+    assert tensors == [
+        KVCacheTensor(
+            size=scalable_blocks * c128a_spec.page_size_bytes,
+            shared_by=[c128a_layer],
+            block_stride=c128a_spec.page_size_bytes,
+        ),
+        KVCacheTensor(
+            size=partial_blocks * c4a_spec.page_size_bytes,
+            shared_by=[c4a_layer],
+        ),
+    ]
 
 
 @pytest.fixture(autouse=True)

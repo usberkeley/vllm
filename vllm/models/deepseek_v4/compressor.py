@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 
 import torch
@@ -336,6 +337,33 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = k_cache_layer.kv_cache
+        sparse_coordinator = getattr(
+            k_cache_layer,
+            "sparse_page_offload_coordinator",
+            None,
+        )
+        if (
+            sparse_coordinator is not None
+            and sparse_coordinator.config.allocate_partial
+            and self.compress_ratio == 4
+            and sparse_coordinator.adapter.supports_layer(
+                self.k_cache_prefix,
+                k_cache_layer.kv_cache_dtype,
+            )
+        ):
+            if token_to_req_indices is None:
+                raise RuntimeError(
+                    "Sparse c4a partial allocation requires request-row metadata."
+                )
+            k_cache_metadata = SimpleNamespace(
+                slot_mapping=sparse_coordinator.prepare_tail_slot_mapping(
+                    layer_name=self.k_cache_prefix,
+                    positions=positions,
+                    request_rows=token_to_req_indices[: positions.shape[0]],
+                    original_slot_mapping=k_cache_metadata.slot_mapping,
+                    kv_cache=kv_cache,
+                )
+            )
 
         # Plain-row V4 reads a contiguous bf16 / per-tensor fp8 cache row; the
         # fp8_ds_mla path uses the UE8M0 paged uint8 layout.

@@ -11,6 +11,7 @@
 > offload。
 >
 > **实现边界:** 只面向 DeepSeek V4 sparse MLA decode 路径 + PD 分离。
+> 支持 TP,以及启用 EP 的 DP 部署(DP+EP);DCP 仍不支持。
 
 ---
 
@@ -38,6 +39,9 @@ P 经 connector 下沉到 D 的本机 CPU DRAM 权威池,在同卡上容纳更�
 4. offload 走自研 `SparsePageConnector`:拥有全部 V4 层,复用 NIXL 传输原语(DRAM
    注册 / `CopyBlocksOp` / notif),控制面自建。不复用 NIXL 的整层 rehydrate
    语义,不接 LMCache / Mooncake 控制面。
+5. 支持 TP 和 DP+EP。c4a MLA KV 在 TP rank 上按复制语义处理,每个 D worker 独立
+   维护 CPU 权威池、GPU hot pool 和 layer-local block table;DP request 只归属一个
+   D replica,EP 只作用于 MoE 层,不参与 c4a page 的寻址、传输或驻留。
 
 ---
 
@@ -74,6 +78,9 @@ alignment 写成断言,不能只依赖文档常量。
   tail(allocate-partial)。不允许用 NIXL 的整层 rehydrate 把 c4a 静默灌回 HBM。
 - **关闭开关时零行为变化。** dense attention、SWA、C128A、现有 KV connector 与 CPU
   KV offload 路径不受影响。
+- **并行 rank 之间不共享可变驻留状态。** CPU page、hot slot、in-flight job 和 patched
+  block table 都是 D worker-local;TP rank 之间不借用物理 block id,DP replica 之间不
+  迁移活动请求的 page state,EP rank 不进入 page key。
 
 ### 2.3 `block_table` 映射
 
@@ -122,19 +129,62 @@ output, 二选一:
   patched_topk_physical: int32[num_tokens, index_topk]    # fixed address
 ```
 
-### 2.4 暂不支持范围
+### 2.4 并行拓扑契约
 
-Phase 1 fail-closed,以下场景不启用行为型 offload:
+支持以下静态拓扑,并要求在 offload on/off 的相同拓扑上验证 logits:
+
+| 拓扑 | 支持结论 | page ownership 与传输规则 |
+|---|---|---|
+| `TP > 1, DP = 1, EP off/on` | 支持 | DeepSeek V4 MLA c4a KV 在 TP rank 上复制;每个 D TP worker 有独立 CPU 权威副本和 hot pool,按本 rank 的 block table page-in;开启 EP 只改变 MoE expert ownership |
+| `TP >= 1, DP > 1, EP off` | 支持 | 每个请求固定归属一个 D DP replica;该 replica 的 TP workers 独占请求 page state |
+| `TP >= 1, DP > 1, EP on` | 支持 | 先按 DP replica 隔离请求,再在该 replica 的 TP workers 上按复制 KV 语义各自 page-in;EP group 不改变 KV ownership |
+
+TP 传输复用 NIXL `TransferTopology` / TP mapping,而不是在
+`SparsePageConnector` 中另写 rank 算法:
+
+- P/D TP size 相同或一方是另一方的整数倍;其他比例启动时 fail closed。
+- MLA KV 是复制布局。每个 D TP rank 只从 TP mapping 选出的一个 P TP rank 读取
+  c4a page;P TP 较大时不拼接多个副本,P TP 较小时允许多个 D rank 读取同一 P rank。
+- 每个 D TP rank 本地运行 indexer、miss 判定、page-in 和 block table patch。正常 TP
+  执行下 top-k 和 logical page 集合应一致,但 GPU phys block id 和 residency 状态允许
+  不同;热路径不增加 TP collective。
+- CPU 权威副本先按 worker-local 方案实现,因此 host 容量和 P→D c4a 流量会随 D TP
+  size 复制。跨 TP rank 共享一份 CPU pool 属于后续优化,不能作为正确性依赖。
+
+DP+EP 遵循 request ownership,不按 EP expert ownership 路由 page:
+
+- router/connector 必须把每个请求显式绑定到一个 D DP replica,并在请求完成、abort
+  或 preempt 前保持亲和性。P DP rank 与 D DP rank 不要求编号或数量相同。
+- connector endpoint identity 至少区分 producer engine、producer DP rank、consumer
+  engine 和 consumer DP rank;进入具体 worker 后再用 NIXL TP mapping 选择远端 TP rank。
+- EP 只改变 MoE expert 的放置和通信。MoE all-to-all 完成后,attention 仍使用请求所属
+  DP replica 的本地 KV;不得按 `ep_rank` 复制、迁移或查找 c4a page。
+- 活动请求跨 DP replica 迁移和 elastic DP/EP resize 不在本设计内;发生时必须先 drain
+  请求,否则对该请求 fail closed。
+
+状态的全局定位可写为:
+
+```text
+WorkerRoute = (consumer_engine_id, consumer_dp_rank, consumer_tp_rank)
+PageOwner   = (WorkerRoute, request_id, generation, layer_name, page_idx)
+```
+
+`WorkerRoute` 只用于 connector 路由、日志和一致性校验。worker 内部 manager 已由进程
+隔离,仍可使用紧凑的 `(request_id, generation, layer_name, page_idx)` 作为 page key。
+
+### 2.5 暂不支持范围
+
+以下场景不启用行为型 offload:
 
 - 纯聚合部署(prefill/decode 同实例)。本设计只支持 PD 分离。
 - 非 DeepSeek V4、非 `fp8_ds_mla`、非 `compress_ratio == 4` c4a 层。
 - DCP / decode context parallel。当前 indexer 对 `compress_ratio > 1` + DCP
   仍是 `NotImplementedError`,offload 不应绕过该限制。
+- P/D TP size 既不相同、也不存在整数倍关系;活动请求跨 DP replica 迁移;活动请求期间
+  elastic DP/EP resize。
 - C128A、SWA、dense MLA、ROCm/XPU backend。
 - MTP/native spec decode、多 token decode、DSpark non-causal decode,除非另有
   logits 无损验证。
-- CPU pool 不足、hot pool 无可驱逐页、connector 传输失败、backend shape 不匹配、
-  D 侧 allocate-partial 不支持。
 
 禁用时必须保持原路径行为(包括退回不启用 PD offload,由 D 常规接收全量 c4a 到
 HBM),最多输出一次 warning 或 telemetry 标记。
@@ -146,20 +196,22 @@ HBM),最多输出一次 warning 或 telemetry 标记。
 ### 3.1 数据流
 
 ```text
-P (prefill 实例):
+P[producer_dp_rank, producer_tp_rank] (prefill worker):
   c4a page 写满 -> seal
   prefill sparse MLA 用原始 block_table 完成 gather -> 出首 token
   connector.save 按 layer_name 分流:
     c4a       -> NIXL DRAM xfer 到 D 的 CPU 权威池
     indexer key / C128A / SWA -> 常规 KV 传输到 D 的 HBM
-  request_finished -> free-now, kv_transfer_params 携带 last-token Top-K 页
+  request_finished -> free-now, kv_transfer_params 携带 transfer 描述符与 tail 页引用
   P allocator 整请求释放 KV
 
-D (decode 实例):
+D[consumer_dp_rank, consumer_tp_rank] (decode worker):
+  request route 固定 consumer_dp_rank
+  NIXL TP mapping 选择 producer_tp_rank
   connector 收齐 c4a latent -> 落 CPU 权威池, 标 cpu_ready_evicted
+                c4a tail 页 -> 从 CPU restore 到 D HBM
                 其余层 -> 落 HBM
-  last-token Top-K 页 seed -> per-layer hot pool
-  allocate-partial: c4a 只在 HBM 分配 hot pool + tail
+  allocate-partial: c4a 只在 HBM 分配 hot pool + tail;hot pool 起始为空
 
   decode 每层:
     indexer top-k
@@ -174,15 +226,19 @@ CPU DRAM 是只读权威池,驻留在 D 本机 NUMA/Grace 内存;GPU hot pool �
 evict 不写回,只删除 residency 映射并释放 GPU slot。页在当前 decode step 中所有
 消费者完成前不能释放 GPU 槽。
 
-PD 分离下主干验收不是"复制到 CPU 后仍保留原 GPU cache",而是 **D 从一开始就不为
-c4a 全量分配 HBM**:c4a 的 HBM survivor set 收敛到 last-token Top-K latent 集合、
-hot pool 和 mutable tail。
+以上状态全部是 D worker-local。TP 的每个 worker 持有相同 logical c4a 内容的独立
+CPU/GPU 副本,但物理 slot 可以不同;DP replica 只持有路由到自己的请求;EP collective
+不访问 page offload manager。connector sideband 在 scheduler 聚合 tail page 与 transfer
+描述符,但下发给 worker 时必须保留 consumer DP ownership,不能广播到其他 DP replica。
 
-last-token Top-K latent 可按页粒度承载:P 从最后一个有效 token 的 `topk_indices`
-取出去重 logical pages 随 KV 一起发送,D 用它 seed hot pool;页内未被 Top-K 命中的
-latent 是页粒度 carrier 的副作用,不计入逻辑 survivor set。若后续 backend 支持
-compact physical top-k buffer,可把 survivor set 降到条目粒度,但 Phase 1 不要求改
-kernel gather 语义。
+PD 分离下主干验收不是"复制到 CPU 后仍保留原 GPU cache",而是 **D 从一开始就不为
+c4a 全量分配 HBM**:c4a 的 HBM survivor set 收敛到 hot pool 和 mutable tail。
+
+D 侧 hot pool 起始为空,不在 prefill/接收阶段预热。进入 decode 后,hot pool 完全由
+每层 top-k 的真实 miss 驱动 CPU->GPU page-in 逐步填充,不从 P 传输 last-token Top-K
+页来 seed。代价是首个 decode step 会对选中页产生一次冷启动 miss;收益是去掉一条
+"P 产生、传输、但 D 接收侧未消费"的 sideband 链路。是否重新引入 seed 预热应由
+first-decode-step 的 miss 遥测证明,而不是默认开启。
 
 ### 3.2 MLA page offload 模块
 
@@ -198,14 +254,14 @@ adapter。P→D 的填充由 `SparsePageConnector`(在 `vllm/distributed/kv_tran
 vllm/v1/attention/backends/mla/page_offload/
 ├── __init__.py
 ├── config.py            SparsePageOffloadConfig
-├── selected_pages.py    SparsePageAdapter / SparsePageSelection
-├── paging.py            SparsePageState / SparseHotPagePool
-├── cpu_pool.py          CPUAuthoritativePagePool
-├── manager.py           SparsePageOffloadManager
-├── block_table.py       LayerLocalBlockTables
-├── transfer.py          页 page-in copy 描述符(复用 CopyBlocksOp)
+├── selection.py         SparsePageAdapter / SparsePageSelection
+├── hot_pool.py          SparsePageHotPool / SparsePageStagingPlan
+├── staging.py           SparsePageStagingManager
+├── block_table_cache.py LayerLocalBlockTableCache
+├── protocol.py          sideband / route wire 数据模型
+├── route_tracker.py     producer generation / consumer route 生命周期
 ├── coordinator.py       SparsePageOffloadCoordinator
-├── telemetry.py         SparseSelectionCollector
+├── selection_metrics.py SparsePageSelectionCollector
 └── adapters/
     └── deepseek_v4_c4a.py
 ```
@@ -215,22 +271,22 @@ vllm/v1/attention/backends/mla/page_offload/
 | 文件 | 职责 | 不负责 |
 |---|---|---|
 | `__init__.py` | 暴露最小公共入口,例如 coordinator/config/adapter 类型;避免让模型侧 import 内部状态类 | 不做注册副作用,不初始化全局状态 |
-| `config.py` | 解析和校验 page offload 配置,包括开关、每层 hot pool 页数、lookahead、层选择、带宽预算、观测模式、传输后端 | 不读取 HF model config 的模型语义,不决定某个 layer 是否可 offload |
-| `selected_pages.py` | 定义 adapter 抽象和一次 top-k 选择的结构化结果,例如 `(request, layer, logical_page)` 去重集合、真实 miss 集合、tail pin 标记 | 不维护长期 residency,不分配 GPU/CPU 槽 |
-| `paging.py` | 维护 GPU hot pool 和页驻留状态,包括 `LogicalPage -> PhysSlot`、in-flight 引用、tail pin、本步 protected 页、hot_score 和淘汰候选 | 不提交传输,不 patch block table,不关心具体模型 top-k 张量布局 |
-| `cpu_pool.py` | 管理 D 侧 CPU DRAM 权威副本的页槽和生命周期,接收 connector 送来的页,记录 ready/ref_cnt 状态,按请求结束释放 | 不做 GPU hot pool 淘汰,不拥有 P→D 传输 |
-| `manager.py` | 聚合 `paging.py` 与 `cpu_pool.py` 的状态机,提供 receive(connector 填充)、seed、promote/load、evict、complete、request cleanup 等 D worker-side 控制面 | 不实现 scheduler-side `OffloadingManager`,不拥有 connector |
-| `block_table.py` | 管理固定地址、固定形状的 layer-local compressed block table buffer,并提供原地 patch 接口 | 不修改共享 `attn_metadata.block_table`,不 patch SWA block table |
-| `transfer.py` | 把 D 侧 page-in(CPU→GPU hot pool)翻译成可提交给 `CopyBlocksOp` 的批量页 copy 描述符 | 不实现跨实例传输,不改变现有 CPU KV offload 的 block-level copy 语义 |
+| `config.py` | 解析和校验 page offload 配置,包括开关、每层 hot pool 页数、lookahead、层选择、带宽预算、传输后端 | 不读取 HF model config 的模型语义,不决定某个 layer 是否可 offload |
+| `selection.py` | 定义 adapter 抽象和一次 top-k 选择的结构化结果,例如 `(request, layer, logical_page)` 去重集合、真实 miss 集合、tail pin 标记 | 不维护长期 residency,不分配 GPU/CPU 槽 |
+| `hot_pool.py` | 维护 layer-local GPU hot pool、LRU 驻留和每请求配额,把一次选择转换为不可变 `SparsePageStagingPlan` | 不提交传输,不 patch block table,不持有 CPU 权威页 |
+| `staging.py` | 执行 staging plan,管理 Phase 1 同步 CPU mirror、批量 page-in/tail copy、prefill seal 和 request cleanup | 不决定淘汰策略,不实现 scheduler-side `OffloadingManager`,不拥有 connector |
+| `block_table_cache.py` | 管理固定地址、固定形状的 layer-local compressed block table buffer,并提供原地 patch 接口 | 不修改共享 `attn_metadata.block_table`,不 patch SWA block table |
+| `protocol.py` | 定义 P→D sideband、page reference 和包含 TP/DP/EP identity 的 route wire model | 不维护活跃请求状态,不做 page staging |
+| `route_tracker.py` | 封装 producer generation、consumer route 唯一绑定、stale 检查和完成清理 | 不解析 NIXL 参数,不持有 KV tensor 或 page residency |
 | `coordinator.py` | 每层 decode 的编排入口:接收 adapter selection,查询 residency,触发 page-in,等待真实 miss,调用 block table patch,向 telemetry 记账 | 不包含 DeepSeek V4 kernel 细节,不直接调用 FlashMLA kernel |
-| `telemetry.py` | 只读观测和 go/no-go 指标,包括 unique selected pages、miss(H)、复用率、搬运字节、wait 预算、hot-set drift | 不改变调度行为,不提交传输,不影响 logits |
+| `selection_metrics.py` | 记录实际 staging 的 go/no-go 指标,包括 unique selected pages、miss(H)、复用率、搬运字节、wait 预算、hot-set drift | 不改变调度行为,不提交传输,不影响 logits |
 | `adapters/deepseek_v4_c4a.py` | DeepSeek V4 c4a 适配层:识别 c4a 层,解释 top-k indices 和 compressed block table 列语义,提供页大小/页列/尾页规则,供 connector 分流与 coordinator 复用 | 不实现通用状态机,不处理 GLM 5.2 或其他模型 |
 
 依赖方向保持单向:DeepSeek/MLA 执行路径调用 `coordinator.py`;coordinator 依赖
-manager/paging/cpu_pool/block_table/transfer;adapter 只提供模型语义;
-`SparsePageConnector` 从 P→D 填充 `cpu_pool`,并调用 manager 的 receive/seed 入口。
-`transfer.py` 与 connector 复用 NIXL 的 `CopyBlocksOp`,但 `kv_transfer` 不反向
-import page offload 内部状态类。
+staging/hot_pool/block_table_cache,adapter 只提供模型语义。`SparsePageConnector` 只依赖
+config、protocol、route_tracker 和 coordinator 公共入口,不 import hot pool 或 staging
+内部数据面状态。后续异步传输可在 staging 下增加 transfer/CPU pool 实现,不改变
+staging plan 或 connector route 生命周期接口。
 
 page offload 框架只处理 D 侧 selected-page offload 生命周期。模型差异放在
 adapter 中:
@@ -253,6 +309,7 @@ physical GPU slot 混用:
 ```text
 LogicalPage:
   request_id: str | int        # engine request id,不能只用 batch row
+  generation: int              # request id 复用时递增;不复用时可固定为 0
   layer_name: str
   page_idx: int               # compressed logical page, tok // 64
 
@@ -281,9 +338,10 @@ SparsePageSelection:
 ```
 
 `request_id` 必须来自请求生命周期中稳定且不会和 batch row 混淆的 id,且必须能在
-P 与 D 之间对齐(connector 用它路由 CPU 权威页)。若 engine 回收 request id,
-manager 必须在 request cleanup 后移除所有相关 CPU 和 GPU state,或额外引入
-generation/epoch。
+P 与 D 之间对齐(connector 用它路由 CPU 权威页)。`generation` 防止 engine 回收
+request id 后命中旧页;manager 在 request cleanup 后仍必须移除所有相关 CPU 和 GPU
+state。DP 路由信息不塞入 worker-local `LogicalPage`,但 connector metadata 必须携带并
+校验 producer/consumer engine 与 DP rank;TP rank 由 NIXL worker topology 决定。
 
 ### 3.2.2 每层调用时序(D 侧 decode)
 
@@ -293,7 +351,7 @@ indexer forward
 attention backend forward_mqa
   -> if disabled: 原路径
   -> adapter.extract_selection(req_id_per_token, topk_indices_buffer, seq_lens)
-  -> coordinator.prepare_layer(layer_name, selection, source_block_table)
+  -> coordinator.stage_decode_layer(layer_name, selection, source_block_table)
        - update telemetry
        - classify hit/miss/tail
        - submit CPU->GPU page-in for real miss
@@ -303,13 +361,11 @@ attention backend forward_mqa
 coordinator.finish_layer(layer_name)
 ```
 
-只读观测 PR 只执行 `extract_selection` 和 telemetry,不得 submit copy、patch
-block table 或改变传给 kernel 的 tensor。
-
 ### 3.2.3 PD 主干时序
 
 同步原型必须覆盖 3.1 的完整主干:P connector 发送 + D allocate-partial + decode
-同步 reload(单请求、`compress_ratio == 4` c4a 层)。D 每层的 miss 判定为:
+同步 reload(每个 D DP replica 先覆盖单请求、该 replica 内覆盖全部 TP rank、
+`compress_ratio == 4` c4a 层)。D 每层的 miss 判定为:
 
 ```text
 real_miss = selected_pages - (hot_pool/resident ∪ tail_pages)
@@ -319,11 +375,14 @@ real_miss 同步 CPU->GPU load 到 hot pool -> patch layer-local block_table
 
 主干输出必须能被测试直接观察:
 
-- D 侧 c4a resident GPU block 数 = `hot_pool + tail + last_token_topk_carrier`,
-  不等于完整 prompt 的 c4a 页数。
+- D 侧 c4a resident GPU block 数 = `hot_pool + tail`,不等于完整 prompt 的 c4a 页数。
 - P 侧 `request_finished` 后 KV 整体释放,没有生命周期中途的单页 free。
 - CPU 权威池包含所有 sealed c4a 页且 ready。
 - 下一个 decode step 的 logits 与 offload 关闭时一致。
+- 同一请求只出现在一个 D DP replica;该 replica 的每个 TP rank 都能独立完成 page-in,
+  且 patched phys block id 只引用本 rank hot pool。
+- 开启 EP 前后 page key、connector route 和 c4a resident block 统计不因 expert
+  placement 改变。
 
 若 D 侧 block allocator 不能安全地为单层 c4a 只分配部分页(allocate-partial),
 同步原型应先补 allocator 接口或 fail closed;不得让 D 常规分配全量 c4a HBM 后再
@@ -331,7 +390,7 @@ real_miss 同步 CPU->GPU load 到 hot pool -> patch layer-local block_table
 
 ### 3.3 控制策略
 
-每个 `(request, layer)` 维护:
+每个 D worker 为本 DP replica 拥有的请求按 `(request, generation, layer)` 维护:
 
 - `residency: LogicalPage -> PhysSlot`
 - `hot_score`
@@ -390,7 +449,7 @@ P→D 的 c4a latent 传输走自研 `SparsePageConnector`,只复用 NIXL 的传
 |---|---|---|
 | 逐层分流 | base 提供逐层 hook `save_kv_layer(layer_name, kv_layer, ...)`;但 NIXL 实现是 no-op,按整请求 block 搬、不认层型,分流逻辑须自写 | `nixl/connector.py` `save_kv_layer`;`multi_connector.py` 广播 dispatch |
 | DRAM 落地 | 支持。`nixl_memory_type="DRAM"`、逐层 `host_xfer_buffers[layer_name]` CPU tensor、`CopyBlocksOp` 的 `d2h`/`h2d` 原语齐备 | `nixl/base_worker.py` |
-| P free-now + sideband | 支持。`request_finished -> (async_free, kv_transfer_params)`,P 天然释放并可携带 last-token Top-K 页列表 | `base.py` `request_finished` |
+| P free-now + sideband | 支持。`request_finished -> (async_free, kv_transfer_params)`,P 天然释放并可携带 tail 页引用与 transfer 描述符 | `base.py` `request_finished` |
 
 两个必须绕开的 NIXL 语义:
 
@@ -407,18 +466,35 @@ P→D 的 c4a latent 传输走自研 `SparsePageConnector`,只复用 NIXL 的传
 
 ```text
 SparsePageConnector(自研,拥有全部 V4 层)
-  复用 NIXL worker 原语: agent 握手 / DRAM+VRAM 注册 / CopyBlocksOp(d2h,h2d) / notif 轮询
+  复用 NIXL worker 原语和拓扑:
+    agent 握手 / TransferTopology / TP mapping
+    DRAM+VRAM 注册 / CopyBlocksOp(d2h,h2d) / notif 轮询
 
   save (P 侧, 按 layer_name 分流):
     c4a      -> NIXL DRAM xfer 到 D 的紧凑 CPU 权威池
     其余层    -> 常规 HBM block xfer(委托 NIXL 现有 block 路径)
-  request_finished -> free-now + kv_transfer_params 携带 last-token Top-K 页
+  request_finished -> free-now + kv_transfer_params 携带 route、generation、
+                      tail 页引用与 transfer 描述符
 
   load (D 侧):
     c4a      -> 落 CPU 权威池, 标 cpu_ready_evicted, 交 manager; 不自动 h2d
     其余层    -> 正常灌回 HBM
   decode hot pool page-in 的 h2d 由 coordinator 逐步驱动, 复用 CopyBlocksOp
 ```
+
+并行部署中 connector 需要分两级路由:
+
+1. scheduler/router 先选定唯一的 `consumer_dp_rank`,并在 sideband 中携带 producer 与
+   consumer engine/DP identity。DP rank 是独立 engine endpoint,不能把请求 metadata
+   广播给整个 DP/EP group。
+2. D worker 使用 NIXL 已有 TP topology 选择远端 producer TP rank。由于 MLA KV
+   复制,每个 D TP worker 拉取一份完整 c4a page 到自己的 CPU pool;不得按普通多头
+   attention 对 latent 内容做 head slice 或 concat。
+
+P/D TP size 不同但可整除时,沿用 NIXL MLA mapping。任何 rank 在握手后看到的
+`is_mla`、page shape、page size、compression ratio 或 layer range 不一致,整个请求
+fail closed。EP rank 不参与以上两级路由;即使 EP group 跨 DP/TP rank,KV endpoint
+仍由 request DP owner 和 attention TP worker 唯一确定。
 
 架构取舍:
 
@@ -427,14 +503,15 @@ SparsePageConnector(自研,拥有全部 V4 层)
 - **不 fork NIXL 整块 worker。** 它是 request-block 粒度、load 时自动 rehydrate,
   硬塞逐层 + 留 CPU 是对抗其模型。只取传输原语,薄壳持有 `NixlWrapper` 直接调底层。
 - **不接 LMCache / Mooncake 控制面。** 其 key 语义(前缀 / 内容哈希)与
-  `(request, layer, logical_page)` 冲突。Mooncake transfer engine 可作为 Phase 2
-  跨节点传输替换 NIXL,控制面不变。
+  `(request, layer, logical_page)` 冲突。
 
 #### 3.4.3 传输层复用边界
 
 复用:
 
 - NIXL 的 agent 握手、DRAM/VRAM 注册、`CopyBlocksOp`(`d2h`/`h2d`)、notif 轮询。
+- NIXL `TransferTopology` 和 MLA TP mapping;支持相同 TP size 以及可整除的异构 TP,
+  不自行推导远端 TP rank。
 - `request_finished -> (async_free, kv_transfer_params)` 的 free-now 与 sideband。
 - `BlockStatus` 的 ready/ref_cnt 语义可借鉴到 `CPUPageRef`。
 
@@ -468,10 +545,11 @@ SparsePageCopySpec:
 
 ## 4. 容量与性能模型
 
-### 4.1 D 侧 HBM 常驻底线
+### 4.1 D worker 的 HBM 常驻底线
 
-D 的常驻底线必须逐层求和。以下模型按 `fp8_ds_mla` 的 584B c4a/C128A 条目估算;
-plain bf16/per-tensor fp8 cache dtype 需要替换页大小:
+D 的常驻底线必须逐 worker、逐层求和。以下模型是一个 D TP worker/GPU 的预算,
+按 `fp8_ds_mla` 的 584B c4a/C128A 条目估算;plain bf16/per-tensor fp8 cache dtype
+需要替换页大小:
 
 ```text
 HBM_floor(D) =
@@ -488,6 +566,16 @@ hot pool 是 per (request, layer):c4a page 是请求私有 KV,跨请求无页复
 同请求同层跨 decode step。因此 hot pool 随并发线性增长,收益来自把 c4a 全量池
 `ceil(S/256)` 页替换成 `H_L` 个 hot pool 页。PD 分离下 D 从一开始就按 allocate-partial
 分配,没有 prefill 全量峰值;若 `H_L` 接近全量页数,显存收益趋零。
+
+并行维度的核算规则:
+
+- 上式是 **per D TP worker/GPU**;`H_L` 不除以 TP size。MLA c4a KV 和 selected page
+  在 TP rank 上复制,所以同一请求的集群级 HBM/CPU page 容量约再乘 D TP size。
+- DP 按请求分片,单请求不乘 DP size;集群总量对所有 DP replica 的活动请求求和。
+- EP 不增加 attention KV 副本。不能用 `ep_size` 乘 page 容量,也不能从某个 expert
+  rank 的空闲 HBM 借用 hot slot。
+- worker-local CPU 权威池原型的最坏 host 容量为
+  `sealed_c4a_bytes_per_request * D_TP`;若 host 容量不足则按请求 fail closed。
 
 ### 4.2 `H=512` 的上下文收益
 
@@ -529,6 +617,8 @@ GPU unique pages -> residency bitmap -> miss list/copy descriptors
 - P→D 传输带宽是额外一环:P 出 KV 后一次性把 sealed c4a 送到 D 的 CPU 池,这段
   走 connector/NIXL,不计入 decode step 的分页附加,但要计入首 token→首 decode 的
   端到端时延预算。
+- worker-local TP 副本会让 c4a P→D 总流量近似乘 D TP size。性能验收必须同时报告
+  per-rank 与整 TP group 的传输字节;不得只报告单 rank 带宽。
 
 ---
 
@@ -538,8 +628,10 @@ GPU unique pages -> residency bitmap -> miss list/copy descriptors
 |---|---|
 | `vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py` / `flashinfer_mla_sparse.py` | D 侧 decode 接入点。c4a 且 selected-page offload 已开启(consumer + `SparsePageConnector`)时,在 logical top-k 转 physical top-k 前调用 coordinator,并改用 layer-local patched block table 或 patched physical top-k buffer |
 | `vllm/v1/attention/backends/mla/flashmla_sparse.py` | 仅在目标 commit 确认 DeepSeek V4 使用 FlashMLA sparse decode 时接入;否则只作为 `fp8_ds_mla` layout 和 page size 核对来源 |
-| DeepSeek V4 c4a compressor / KV 写入路径(P 侧) | 页封存时标 sealed;prefill sparse MLA 完成后由 connector 按层分流发送 sealed c4a 到 D 的 CPU 权威池;从 last-token `topk_indices` 提取 seed 页;不做生命周期中途 GPU 释放,由 `request_finished` free-now 整请求释放 |
-| `vllm/distributed/kv_transfer/.../SparsePageConnector`(新增) | PD 部署下自研薄 connector,拥有全部 V4 层;复用 NIXL 传输原语;`save_kv_layer` 按 layer 分流(c4a→D CPU 权威池,其余→D HBM);`request_finished` 返回 free-now 并携带 last-token Top-K seed;load 侧对 c4a 不自动 h2d |
+| DeepSeek V4 c4a compressor / KV 写入路径(P 侧) | 页封存时标 sealed;prefill sparse MLA 完成后由 connector 按层分流发送 sealed c4a 到 D 的 CPU 权威池;不做生命周期中途 GPU 释放,由 `request_finished` free-now 整请求释放 |
+| `vllm/distributed/kv_transfer/.../SparsePageConnector`(新增) | PD 部署下自研薄 connector,拥有全部 V4 层;复用 NIXL 传输原语;`save_kv_layer` 按 layer 分流(c4a→D CPU 权威池,其余→D HBM);`request_finished` 返回 free-now 并携带 tail 页引用与 transfer 描述符;load 侧对 c4a 不自动 h2d,仅把 tail restore 回 HBM |
+| NIXL `TransferTopology` / TP mapping | 直接复用 MLA replicated-KV 的 P/D TP rank 映射;相同或可整除异构 TP 均由握手结果驱动;selected-page 路径不得另建一套 TP 映射 |
+| scheduler / PD request router | 选择并固定 `consumer_dp_rank`;sideband 携带 producer/consumer engine、DP identity 和 request generation;不把 page state 广播到 EP group |
 | D 侧 KV block manager / allocate-partial | c4a 层只在 HBM 分配 hot pool + tail,不排满全量 c4a;evicted 逻辑页不会被共享 `block_table` 读到;若不支持,fail closed |
 | `vllm/v1/attention/backends/mla/page_offload/` | D 侧 selected-page coordinator、adapter、驻留/热页状态、观测和 page-in 辅助 |
 | NIXL 传输原语 / `CopyBlocksOp` | 仅复用 P→D DRAM xfer 与 D 侧 page-in 的 host↔device copy;不复用整层 host mirror 与自动 rehydrate |
@@ -567,8 +659,8 @@ selected-page offload 的开启不再是单独开关,而是由 KV 传输配置�
 | 旋钮(`kv_connector_extra_config`) | 状态 | 说明 |
 |---|---|---|
 | `sparse_page_cpu_pool_size_gib` | 提案 | D 侧 CPU 权威池预算;独立于现有 KVTransfer offload |
-| `sparse_page_transfer_backend` | 提案 | `nixl`(首选)或后续 `mooncake`(Phase 2 跨节点);只复用传输原语,不启用其控制面 |
-| `sparse_page_hot_pool_blocks` | 提案 | 每可卸载层 hot pool 页数 `H`(单个整数) |
+| `sparse_page_transfer_backend` | 提案 | `nixl`;只复用传输原语,不启用其控制面 |
+| `sparse_page_hot_pool_blocks` | 提案 | 每请求、每可卸载层的 resident hot 页上限 `H`(单个整数) |
 | `sparse_page_prefetch_lookahead` | 提案 | 跨层/跨步预取深度 |
 | `sparse_page_offload_layers` | 提案 | `auto` 或显式层范围 |
 
@@ -578,10 +670,18 @@ selected-page offload 的开启不再是单独开关,而是由 KV 传输配置�
   CPU pool、不改变 metadata。
 - 选用了 `SparsePageConnector` 作为 consumer 但模型/backend 不满足支持范围时
   fail closed,报清晰错误,不能静默跑半套 offload。
-- `sparse_page_hot_pool_blocks` 以每个可卸载 layer 为单位;residency 按 (request, layer)
-  维护,hot pool 随并发线性增长,telemetry 需按 (request, layer) 记账。
+- `sparse_page_hot_pool_blocks` 以每个请求、每个可卸载 layer 为单位;residency 按
+  (request, layer) 维护,worker 的 resident slot capacity 为
+  `H * max_num_seqs`,telemetry 需按 (request, layer) 记账。
 - `sparse_page_cpu_pool_size_gib` 必须能推导出最大 CPU page 数,并在启动时打印
   `page_size_bytes`、`num_cpu_pages`、`num_c4a_layers`。
+- 启动握手必须打印 producer/consumer engine 与 DP rank、local/remote TP size、当前
+  TP mapping、MLA replicated 标记。P/D TP size 不可整除时拒绝开启。
+- 每个 DP replica 独立创建 connector endpoint、CPU pool 和 coordinator。配置中的
+  CPU pool 预算是 **per D worker**,不能在 DP/TP/EP world size 间静默均分。
+- `enable_expert_parallel` 不改变 page offload 配置和 page key。若请求在活动期间改变
+  DP owner 或发生 elastic resize,该请求 fail closed;drain 后的新请求可按新拓扑创建
+  state。
 
 不要把 `--kv-offloading-size` 当作 selected-page CPU pool 预算。当前 vLLM 会用它
 自动配置 `KVTransferConfig` 和 `OffloadingConnector`,这会启用现有 CPU KV offload
@@ -591,24 +691,29 @@ selected-page offload 的开启不再是单独开关,而是由 KV 传输配置�
 (以下 `--kv-transfer-config` 为占位,落地时接入正式配置):
 
 ```bash
-# Prefill 实例(发送端)
-CUDA_VISIBLE_DEVICES=0 vllm serve /data/public_models/Deepseek-V4-Flash \
+# Prefill 实例(发送端,TP=2)
+CUDA_VISIBLE_DEVICES=0,1 vllm serve /data/public_models/Deepseek-V4-Flash \
     --kv-cache-dtype fp8 --trust-remote-code --max-model-len 1000000 \
-    --enforce-eager --port 8001 \
+    --tensor-parallel-size 2 --enforce-eager --port 8001 \
     --kv-transfer-config '{"kv_connector": "SparsePageConnector", "kv_role": "kv_producer"}'
 
-# Decode 实例(接收端 + selected-page offload)
+# Decode 实例(接收端 + selected-page offload,TP=2)
 # consumer 角色 + SparsePageConnector 即自动开启 offload;旋钮全部走
 # kv_connector_extra_config,不再使用 --hf-overrides。
-CUDA_VISIBLE_DEVICES=1 vllm serve /data/public_models/Deepseek-V4-Flash \
+CUDA_VISIBLE_DEVICES=2,3 vllm serve /data/public_models/Deepseek-V4-Flash \
     --kv-cache-dtype fp8 --trust-remote-code --max-model-len 1000000 \
-    --enforce-eager --port 8002 \
+    --tensor-parallel-size 2 --enforce-eager --port 8002 \
     --kv-transfer-config '{"kv_connector": "SparsePageConnector", "kv_role": "kv_consumer", "kv_connector_extra_config": {"sparse_page_cpu_pool_size_gib": 128, "sparse_page_transfer_backend": "nixl", "sparse_page_hot_pool_blocks": 512, "sparse_page_prefetch_lookahead": 2, "sparse_page_offload_layers": "auto"}}'
 ```
 
+DP+EP 部署在 P、D 各自实例上增加 `--data-parallel-size <DP>` 和
+`--enable-expert-parallel`;TP 可同时大于 1。PD router 必须把 producer engine/DP rank
+写入 transfer params,并为请求选择唯一 D DP replica。不能仅靠 P/D 的 ordinal DP rank
+相等来隐式配对,因为两侧 DP size 可以不同。
+
 ---
 
-### 6 测试矩阵
+## 6. 测试矩阵
 
 单元测试优先,只在行为型 offload PR 中加入端到端 logits 测试:
 
@@ -616,14 +721,17 @@ CUDA_VISIBLE_DEVICES=1 vllm serve /data/public_models/Deepseek-V4-Flash \
 |---|---|
 | adapter | `tok // 64` 映射到 logical page;top-k 去重;尾页识别;无效 `-1` token 忽略 |
 | block table | layer-local buffer 固定地址;只 patch c4a 层;共享 `block_table` 不变;shape/dtype/device 校验 |
-| connector 分流 | `save_kv_layer` 只把 c4a 发到 CPU 池,indexer/C128A/SWA 走 HBM;load 侧对 c4a 不自动 h2d;`request_finished` free-now 且携带 seed |
-| state machine | connector receive/seed/page-in/evict/cleanup;in-flight ref 保护;request abort;request id 复用与 P/D 对齐 |
+| connector 分流 | `save_kv_layer` 只把 c4a 发到 CPU 池,indexer/C128A/SWA 走 HBM;load 侧对 c4a 不自动 h2d,仅 restore tail;`request_finished` free-now 且携带 tail 页引用 |
+| TP topology | TP=2 同构 P/D;P TP=1→D TP=2;P TP=2→D TP=1;验证每个 D rank 只拉一个完整 MLA page、不 slice/concat、只 patch 本 rank phys block;不可整除 TP fail closed |
+| DP routing | 两个并发请求路由到不同 D DP replica;CPU page/hot slot/cleanup 不串 replica;P/D DP size 不同仍按显式 engine/DP identity 正确路由 |
+| EP orthogonality | `enable_expert_parallel` on/off 使用相同 page key 和 c4a selection;MoE all-to-all 后仍访问 request owner 的本地 KV;EP rank 不出现在 page lookup 中 |
+| state machine | connector receive/tail restore/page-in/evict/cleanup;in-flight ref 保护;request abort;request id 复用与 P/D 对齐 |
 | D allocate-partial | c4a 层只分配 hot pool + tail;evicted 逻辑页不被共享 `block_table` 引用;不全量分配 c4a |
 | transfer | batch 多页 copy descriptor;page size 584B * 64;不触发 SWA/C128A copy |
 | fallback | CPU pool OOM、hot pool 满、无可驱逐页、connector 传输 fail、allocate-partial 不支持、unsupported backend/非 PD |
-| correctness | offload on/off 对同一 prompt 的 logits 无损或在量化容差内一致 |
-| memory accounting | D 侧 c4a GPU resident block 数和 `torch.cuda.memory_allocated`/allocator 统计低于全量;不能只增加 CPU mirror 或 hot pool |
-| CUDA graph | patched buffer 地址稳定;observe-only 不引入 data-dependent allocation |
+| correctness | offload on/off 对同一 prompt 的 logits 无损或在量化容差内一致;至少覆盖 TP=2、TP=2+EP、DP=2+EP、TP=2+DP=2+EP |
+| memory accounting | 每个 D TP worker 的 c4a GPU resident block 数和 `torch.cuda.memory_allocated`/allocator 统计低于全量;同时报告 TP group 汇总,不能只增加 CPU mirror 或 hot pool |
+| CUDA graph | patched buffer 地址稳定;staging 路径不引入 data-dependent allocation |
 
 推荐命令按实际改动收敛到具体文件,例如:
 
@@ -634,7 +742,7 @@ pre-commit run ruff-check --files <changed files>
 ```
 
 若改动影响模型输出、索引语义或 serving 行为,PR 描述必须附 logits 对比或
-model eval 结果;只读观测 PR 可明确说明没有改变 logits 路径。
+model eval 结果。
 
 ---
 
@@ -656,5 +764,5 @@ selected-page offload 是 D worker 侧、逐层、由真实 top-k 驱动的 GPU 
 3. **Mooncake transfer engine** 可作为跨节点传输后端,但仍只是传输层。
 
 因此只复用 NIXL 传输原语、`CopyBlocksOp` 和 `request_finished` 的 free-now/sideband
-语义;控制面由 `SparsePageOffloadCoordinator` / `SparsePageOffloadManager` /
-`SparseHotPagePool` 与 `SparsePageConnector` 自建。
+语义;控制面由 `SparsePageOffloadCoordinator` / `SparsePageStagingManager` /
+`SparsePageHotPool` / `SparsePageRouteTracker` 与 `SparsePageConnector` 自建。
