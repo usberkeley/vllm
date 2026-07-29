@@ -27,6 +27,7 @@ from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
 
+from .afd import AFDConfig
 from .attention import AttentionConfig
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
@@ -367,6 +368,8 @@ class VllmConfig:
     """The configurations for event publishing."""
     ec_transfer_config: ECTransferConfig | None = None
     """The configurations for distributed EC cache transfer."""
+    afd_config: AFDConfig | None = None
+    """The configuration for Attention-FFN Disaggregation."""
     reasoning_config: ReasoningConfig | None = None
     """The configurations for reasoning model."""
     # some opaque config, only used to provide additional information
@@ -488,6 +491,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.ec_transfer_config:
             vllm_factors.append(self.ec_transfer_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.afd_config:
+            vllm_factors.append(self.afd_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.additional_config:
@@ -1470,6 +1477,16 @@ class VllmConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
+
+        if self.afd_config is not None:
+            # Keep the pure AFD marker visible as an FX partition point. The
+            # marker never communicates; AFD event loops own all transport.
+            from vllm.model_executor.layers.afd.ops import AFD_SPLITTING_OPS
+
+            if self.compilation_config.splitting_ops is not None:
+                for op in AFD_SPLITTING_OPS:
+                    if op not in self.compilation_config.splitting_ops:
+                        self.compilation_config.splitting_ops.append(op)
 
         if self.compilation_config.pass_config.enable_sp:
             # With pipeline parallelism, native rms norm tracing errors due to

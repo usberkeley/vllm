@@ -21,6 +21,10 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.core.kv_cache_coordinator import (
+    KVCacheCoordinatorNoPrefixCache,
+    get_kv_cache_coordinator,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -72,6 +76,23 @@ def _auto_init_hash_fn(request):
     else:
         hash_fn = sha256
     init_none_hash(hash_fn)
+
+
+def test_empty_kv_cache_uses_no_prefix_coordinator():
+    coordinator = get_kv_cache_coordinator(
+        KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[]),
+        max_model_len=1,
+        max_in_flight_tokens=1,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        scheduler_block_size=1,
+        hash_block_size=1,
+    )
+
+    assert isinstance(coordinator, KVCacheCoordinatorNoPrefixCache)
 
 
 def make_request(

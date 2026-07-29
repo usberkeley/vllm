@@ -242,6 +242,7 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.distributed.afd_transfer.runtime import AFDRuntime
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
@@ -528,6 +529,7 @@ class GPUModelRunner(
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config
         )
+        self.afd_runtime: AFDRuntime | None = None
 
         if self.model_config.is_encoder_decoder:
             # Maximum length of the encoder input, only for encoder-decoder
@@ -4112,6 +4114,8 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if self.afd_runtime is not None:
+            self.afd_runtime.reject_scheduler_execution_for_ffn()
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4220,6 +4224,25 @@ class GPUModelRunner(
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
+            afd_runtime = self.afd_runtime
+            afd_attention_runtime = (
+                afd_runtime
+                if afd_runtime is not None and afd_runtime.is_attention
+                else None
+            )
+
+            if afd_attention_runtime is not None:
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                ) = afd_attention_runtime.configure_batch_execution(
+                    num_tokens_unpadded,
+                    num_reqs,
+                    cudagraph_mode,
+                    batch_desc,
+                )
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4390,13 +4413,25 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            if afd_attention_runtime is not None:
+                model_output = afd_attention_runtime.execute_attention(
+                    input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
+                    positions=positions,
+                    attn_metadata=attn_metadata,
+                    slot_mappings=slot_mappings,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    cudagraph_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                )
+            else:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5364,6 +5399,17 @@ class GPUModelRunner(
             self.get_model(), "requires_sequential_video_encoding"
         )  # Temporary hack for dynamic res video w/o support for bs>1 yet
 
+        afd_config = self.vllm_config.afd_config
+        if afd_config is not None:
+            from vllm.distributed.afd_transfer.runtime import AFDRuntime
+
+            self.afd_runtime = AFDRuntime.create(
+                self.vllm_config,
+                self.get_model(),
+                supports_mm_inputs=self.supports_mm_inputs,
+                is_pooling_model=self.is_pooling_model,
+            )
+
         if (
             self._moe_model is not None
             and self.parallel_config.enable_eplb
@@ -5383,6 +5429,8 @@ class GPUModelRunner(
             backend = self.vllm_config.compilation_config.init_backend(self.vllm_config)
             compilation_counter.stock_torch_compile_count += 1
             self.model.compile(fullgraph=True, backend=backend)
+            if self.afd_runtime is not None and not load_dummy_weights:
+                self.afd_runtime.start()
             return
         # for other compilation modes, cudagraph behavior is controlled by
         # CudagraphWrapper and CudagraphDispatcher of vllm.
@@ -5419,6 +5467,8 @@ class GPUModelRunner(
                 )
 
         get_offloader().post_init()
+        if self.afd_runtime is not None and not load_dummy_weights:
+            self.afd_runtime.start()
 
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
         if not self.use_aux_hidden_state_outputs:
@@ -6482,6 +6532,9 @@ class GPUModelRunner(
         memory is reclaimable when running in the same process."""
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
+
+        if self.afd_runtime is not None:
+            self.afd_runtime.close()
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()

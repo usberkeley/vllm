@@ -852,7 +852,9 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
-    if not enable_caching:
+    # Unitary and Hybrid coordinators require at least one KV cache group.
+    # NoPrefixCache also supports models that enumerate no groups.
+    if not enable_caching or len(kv_cache_config.kv_cache_groups) == 0:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,
             max_model_len,

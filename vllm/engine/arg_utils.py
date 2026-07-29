@@ -34,6 +34,7 @@ from typing_extensions import TypeIs
 
 import vllm.envs as envs
 from vllm.config import (
+    AFDConfig,
     AttentionConfig,
     CacheConfig,
     CompilationConfig,
@@ -674,6 +675,7 @@ class EngineArgs:
     kv_events_config: KVEventsConfig | None = None
 
     ec_transfer_config: ECTransferConfig | None = None
+    afd_config: AFDConfig | None = None
     reasoning_config: ReasoningConfig = get_field(VllmConfig, "reasoning_config")
 
     generation_config: str = ModelConfig.generation_config
@@ -1546,6 +1548,7 @@ class EngineArgs:
         vllm_group.add_argument(
             "--ec-transfer-config", **vllm_kwargs["ec_transfer_config"]
         )
+        vllm_group.add_argument("--afd-config", **vllm_kwargs["afd_config"])
         vllm_group.add_argument(
             "--compilation-config", "-cc", **vllm_kwargs["compilation_config"]
         )
@@ -2378,6 +2381,7 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             ec_transfer_config=self.ec_transfer_config,
+            afd_config=self.afd_config,
             reasoning_config=self.reasoning_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
