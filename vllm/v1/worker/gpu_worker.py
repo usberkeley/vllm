@@ -39,6 +39,9 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.staging import (
+    get_nixl_staging_buffer_bytes,
+)
 from vllm.distributed.parallel_state import (
     Handle,
     checkpoint_prepare_distributed_state,
@@ -470,6 +473,9 @@ class Worker(WorkerBase):
             by adjusting the `gpu_memory_utilization` parameter.
         """
         maybe_apply_startup_plan(self)
+        nixl_staging_pool_bytes = get_nixl_staging_buffer_bytes(
+            self.vllm_config, self.init_snapshot.total_memory
+        )
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
@@ -489,11 +495,20 @@ class Worker(WorkerBase):
                 "correspondingly."
             )
             logger.info(msg)
-            return reserve_mm_ipc_gpu_memory(
+            available_kv_cache_memory_bytes = reserve_mm_ipc_gpu_memory(
                 kv_cache_memory_bytes,
                 self.model_config.multimodal_config,
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
+            if nixl_staging_pool_bytes:
+                logger.info(
+                    "NIXL GPU staging requires an additional %s GiB. Since "
+                    "the KV cache size is explicitly set via kv_cache_memory_bytes, "
+                    "automatic memory sizing is disabled. Please ensure enough memory "
+                    "is available for the nixl staging pool.",
+                    format_gib(nixl_staging_pool_bytes),
+                )
+            return available_kv_cache_memory_bytes
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -541,11 +556,24 @@ class Worker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
-        self.available_kv_cache_memory_bytes = (
+        available_before_nixl_staging = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - nixl_staging_pool_bytes
         )
+        self.available_kv_cache_memory_bytes = (
+            available_before_nixl_staging - nixl_staging_pool_bytes
+        )
+        if (
+            nixl_staging_pool_bytes > 0
+            and available_before_nixl_staging > 0
+            and self.available_kv_cache_memory_bytes <= 0
+        ):
+            raise ValueError(
+                "No memory remains for KV cache after reserving the NIXL GPU "
+                f"staging pool ({format_gib(nixl_staging_pool_bytes)} GiB)."
+            )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
@@ -564,6 +592,11 @@ class Worker(WorkerBase):
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),
         )
+        if nixl_staging_pool_bytes:
+            logger.info_once(
+                "Reserved %s GiB for the NIXL GPU staging pool",
+                format_gib(nixl_staging_pool_bytes),
+            )
 
         if cudagraph_memory_estimate > 0:
             total_mem = self.init_snapshot.total_memory

@@ -42,8 +42,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   5: Add remote_blocks_expiry_time to kv_transfer_params + handshake
 #      clock-sync timestamp
 #   6: Validate EAGLE/MTP speculative configuration compatibility
+#   7: Advertise bounded GPU staging regions for push transfers
 #
-NIXL_CONNECTOR_VERSION: int = 6
+NIXL_CONNECTOR_VERSION: int = 7
 
 
 @dataclass
@@ -59,6 +60,11 @@ class NixlAgentMetadata:
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
     physical_blocks_per_logical_kv_block: int
+    staging_protocol_version: int = 0
+    staging_buffer_base_addr: int = 0
+    staging_buffer_size: int = 0
+    staging_slot_size: int = 0
+    staging_slot_count: int = 0
 
 
 @dataclass

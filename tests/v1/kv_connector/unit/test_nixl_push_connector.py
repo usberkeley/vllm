@@ -24,13 +24,15 @@ import logging
 import queue
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import msgspec
 import pytest
+import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
@@ -39,6 +41,19 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
+    _StagingPackTask,
+    _StagingSendState,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.staging import (
+    STAGE_RELEASE_NOTIF_PREFIX,
+    STAGING_PROTOCOL_VERSION,
+    NixlStagingConfig,
+    RemoteStagingRegion,
+    StagingCredit,
+    StagingSlotPool,
+    gather_staging_blocks,
+    get_nixl_staging_buffer_bytes,
+    scatter_staging_blocks,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
@@ -109,6 +124,102 @@ def _stub_sw_clipping(scheduler) -> None:
     """Make ``get_exchange_clipped_blocks`` a passthrough so tests don't
     need the full sliding-window machinery."""
     scheduler.get_exchange_clipped_blocks = lambda block_ids, clip_ssm=True: block_ids
+
+
+def _staging_vllm_config(extra_config: dict[str, Any]) -> SimpleNamespace:
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="NixlPushConnector",
+            kv_connector_extra_config=extra_config,
+        )
+    )
+
+
+class TestStagingConfigAndPool:
+    def test_fraction_reserves_aligned_per_gpu_pool(self):
+        config = _staging_vllm_config({"staging_buffer_fraction": 0.01})
+        total_memory = 288_000_000_000
+
+        staging = NixlStagingConfig.from_vllm_config(config, total_memory)
+
+        assert staging.active
+        assert staging.slot_count == 10
+        assert staging.pool_bytes == 10 * 256 * 1024 * 1024
+        assert get_nixl_staging_buffer_bytes(config, total_memory) == (
+            staging.pool_bytes
+        )
+
+    def test_small_pool_falls_back_or_fails_closed(self):
+        direct = _staging_vllm_config(
+            {
+                "staging_buffer_bytes": 2 * 1024,
+                "staging_slot_bytes": 1024,
+            }
+        )
+        assert get_nixl_staging_buffer_bytes(direct, 1 << 30) == 0
+
+        fail = _staging_vllm_config(
+            {
+                "staging_buffer_bytes": 2 * 1024,
+                "staging_slot_bytes": 1024,
+                "staging_fallback": "fail",
+            }
+        )
+        with pytest.raises(ValueError, match="at least 3 slots"):
+            NixlStagingConfig.from_vllm_config(fail, 1 << 30)
+
+    def test_slot_pool_is_bounded_and_rejects_double_release(self):
+        pool = StagingSlotPool(torch.empty(3 * 1024, dtype=torch.uint8), 1024)
+
+        slots = [pool.acquire(), pool.acquire(), pool.acquire()]
+        assert slots == [0, 1, 2]
+        assert pool.acquire() is None
+        assert pool.num_free == 0
+
+        pool.release(1)
+        assert pool.acquire() == 1
+        pool.release(1)
+        with pytest.raises(RuntimeError, match="not in use"):
+            pool.release(1)
+
+    def test_remote_region_requires_matching_protocol_and_three_slots(self):
+        region = RemoteStagingRegion(
+            base_addr=1234,
+            pool_bytes=3 * 1024,
+            slot_bytes=1024,
+            slot_count=3,
+            device_id=0,
+            protocol_version=STAGING_PROTOCOL_VERSION,
+        )
+        assert region.enabled
+        assert not RemoteStagingRegion(
+            base_addr=1234,
+            pool_bytes=2 * 1024,
+            slot_bytes=1024,
+            slot_count=2,
+            device_id=0,
+            protocol_version=STAGING_PROTOCOL_VERSION,
+        ).enabled
+
+    def test_gather_and_scatter_preserve_block_mapping(self):
+        source = (
+            torch.arange(24, dtype=torch.float32).view(4, 2, 3),
+            torch.arange(8, dtype=torch.float16).view(4, 1, 2),
+        )
+        source_ids = torch.tensor([3, 1])
+        frame_bytes = sum(cache[0].nbytes for cache in source) * len(source_ids)
+        slot = torch.empty(frame_bytes, dtype=torch.uint8)
+
+        assert gather_staging_blocks(source, slot, source_ids) == frame_bytes
+
+        destination = tuple(torch.full_like(cache, -1) for cache in source)
+        destination_ids = torch.tensor([2, 0])
+        assert scatter_staging_blocks(destination, slot, destination_ids) == frame_bytes
+        for src_cache, dst_cache in zip(source, destination):
+            torch.testing.assert_close(dst_cache[2], src_cache[3])
+            torch.testing.assert_close(dst_cache[0], src_cache[1])
+            assert torch.all(dst_cache[1] == -1)
+            assert torch.all(dst_cache[3] == -1)
 
 
 # ----------------------------------------------------------------- #
@@ -382,6 +493,141 @@ def _registration_data(
         "remote_port": remote_port,
         "remote_tp_size": remote_tp_size,
     }
+
+
+def test_staging_registration_credits_are_bounded_and_released():
+    w = _StubWriterWorker.fresh()
+    w._staging_enabled = True
+    w._staging_config = SimpleNamespace(max_inflight_per_request=2)
+    w._staging_pool = StagingSlotPool(torch.empty(3 * 1024, dtype=torch.uint8), 1024)
+    w._remote_staging_capable = {"prefill-engine": True}
+    w._staging_recv_epochs = [0, 0, 0]
+    w._staging_recv_owners = {}
+    w._staging_recv_busy = set()
+    w._staging_registration_credits = {}
+    w._staging_recv_progress = {}
+
+    prepared = w._prepare_staging_registration(
+        "req-credit", _registration_data("req-credit")
+    )
+
+    assert prepared is not None
+    assert prepared["staging_protocol_version"] == STAGING_PROTOCOL_VERSION
+    assert prepared["staging_credits"] == [
+        {"slot_id": 0, "epoch": 0},
+        {"slot_id": 1, "epoch": 0},
+    ]
+    assert w._staging_pool.num_free == 1
+
+    release = STAGE_RELEASE_NOTIF_PREFIX + msgspec.msgpack.encode(
+        {
+            "request_id": "req-credit",
+            "credits": prepared["staging_credits"],
+        }
+    )
+    w._handle_staging_release_notif(release)
+
+    assert w._staging_pool.num_free == 3
+    assert w._staging_recv_owners == {}
+    assert "req-credit" not in w._staging_registration_credits
+
+
+def test_staging_cancel_waits_for_gather_before_reusing_local_slot():
+    class ManualEvent:
+        ready = False
+
+        def query(self):
+            return self.ready
+
+    w = _StubWriterWorker.fresh()
+    pool = StagingSlotPool(torch.empty(3 * 1024, dtype=torch.uint8), 1024)
+    local_slot = pool.acquire()
+    assert local_slot == 0
+    remote_credit = StagingCredit(slot_id=4, epoch=2)
+    state = _StagingSendState(
+        request_id="req-cancel",
+        decode_request_id="decode-cancel",
+        decode_engine_id="decode-engine",
+        remote_rank=0,
+        local_block_ids=[1],
+        blocks_per_chunk=1,
+        total_chunks=1,
+        credits=deque(),
+        packing=1,
+    )
+    event = ManualEvent()
+    task = _StagingPackTask(
+        request_id=state.request_id,
+        local_slot=local_slot,
+        remote_credit=remote_credit,
+        chunk_index=0,
+        block_start=0,
+        block_count=1,
+        valid_bytes=16,
+        event=event,  # type: ignore[arg-type]
+        indices=torch.tensor([1]),
+    )
+    w._staging_pool = pool
+    w._staging_sends = {state.request_id: state}
+    w._staging_send_order = deque([state.request_id])
+    w._staging_pack_tasks = [task]
+    w._staging_nixl_tasks = {}
+    w._release_remote_staging_credits = MagicMock()
+
+    w._fail_staging_send(state.request_id)
+
+    assert state.cancelled
+    assert pool.num_free == 2
+    assert state.request_id in w._staging_sends
+
+    event.ready = True
+    w._poll_staging_pack_tasks()
+
+    assert pool.num_free == 3
+    assert state.request_id not in w._staging_sends
+    w._release_remote_staging_credits.assert_called_once_with(
+        "decode-engine", "decode-cancel", [remote_credit]
+    )
+
+
+def test_staging_scheduler_round_robins_batch_requests():
+    w = _StubWriterWorker.fresh()
+    w._staging_pool = StagingSlotPool(torch.empty(3 * 1024, dtype=torch.uint8), 1024)
+    w._staging_config = SimpleNamespace(max_inflight=3, max_inflight_per_request=2)
+    w._staging_pack_tasks = []
+    w._staging_nixl_tasks = {}
+
+    def make_state(request_id: str) -> _StagingSendState:
+        return _StagingSendState(
+            request_id=request_id,
+            decode_request_id=f"decode-{request_id}",
+            decode_engine_id="decode-engine",
+            remote_rank=0,
+            local_block_ids=[0, 1, 2],
+            blocks_per_chunk=1,
+            total_chunks=3,
+            credits=deque([StagingCredit(i, 0) for i in range(3)]),
+        )
+
+    states = {request_id: make_state(request_id) for request_id in ("a", "b")}
+    w._staging_sends = states
+    w._staging_send_order = deque(states)
+    scheduled = []
+
+    def start_gather(state: _StagingSendState):
+        assert w._staging_pool.acquire() is not None
+        state.next_block += 1
+        state.packing += 1
+        scheduled.append(state.request_id)
+        w._staging_pack_tasks.append(None)  # type: ignore[arg-type]
+
+    w._start_staging_gather = start_gather  # type: ignore[method-assign]
+
+    w._schedule_staging_packs()
+
+    assert scheduled == ["a", "b", "a"]
+    assert states["a"].packing == 2
+    assert states["b"].packing == 1
 
 
 class TestPushWriterMatching:
