@@ -42,8 +42,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   5: Add remote_blocks_expiry_time to kv_transfer_params + handshake
 #      clock-sync timestamp
 #   6: Validate EAGLE/MTP speculative configuration compatibility
+#   7: Advertise receiver-pull GPU staging capabilities
 #
-NIXL_CONNECTOR_VERSION: int = 6
+NIXL_CONNECTOR_VERSION: int = 7
 
 
 @dataclass
@@ -59,6 +60,28 @@ class NixlAgentMetadata:
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
     physical_blocks_per_logical_kv_block: int
+    staging_protocol_version: int = 0
+    staging_generation: str | None = None
+    staging_pool_base_addr: int = 0
+    staging_pool_bytes: int = 0
+    staging_slot_bytes: int = 0
+    staging_slot_count: int = 0
+    staging_supported_features: tuple[str, ...] = ()
+
+    @property
+    def supports_staging(self) -> bool:
+        """Whether the handshake advertises internally consistent staging."""
+        if self.staging_protocol_version == 0:
+            return False
+        return (
+            self.staging_generation is not None
+            and self.staging_pool_base_addr > 0
+            and self.staging_pool_bytes > 0
+            and self.staging_slot_bytes > 0
+            and self.staging_slot_count > 0
+            and self.staging_pool_bytes
+            == self.staging_slot_bytes * self.staging_slot_count
+        )
 
 
 @dataclass
