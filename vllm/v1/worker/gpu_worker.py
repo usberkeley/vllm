@@ -472,10 +472,27 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.staging import (
+            resolve_staging_config,
+        )
+
+        staging_config = resolve_staging_config(
+            self.vllm_config, self.init_snapshot.total_memory
+        )
+        staging_bytes = staging_config.buffer_bytes
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+
+            memory_budget = self.init_snapshot.free_memory
+            if kv_cache_memory_bytes + staging_bytes > memory_budget:
+                raise ValueError(
+                    "kv_cache_memory_bytes plus NIXL staging_buffer_bytes exceeds "
+                    f"the worker memory budget ({kv_cache_memory_bytes} + "
+                    f"{staging_bytes} > {memory_budget})"
+                )
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -546,7 +563,13 @@ class Worker(WorkerBase):
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - staging_bytes
         )
+        if self.available_kv_cache_memory_bytes < 0:
+            raise ValueError(
+                "NIXL staging reservation leaves no memory for the KV cache: "
+                f"reserved {staging_bytes} bytes"
+            )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(

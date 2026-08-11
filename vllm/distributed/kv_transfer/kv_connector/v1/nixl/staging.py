@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Hashable, Mapping
@@ -23,7 +24,22 @@ _SLOT_ALIGNMENT = 1
 
 ReadyIdentity: TypeAlias = tuple[str, int, str, str, int, str, str, int, int, int]
 ConsumerIdentity: TypeAlias = tuple[str, int, str]
+ProducerIdentity: TypeAlias = tuple[str, int, str]
 SourceSlotKey: TypeAlias = tuple[str, int, str, int]
+TransferEdgeKey: TypeAlias = tuple[str, str, int, str, int]
+
+
+def transfer_edge_key(
+    value: StagingTransferIntent | StageReady,
+) -> TransferEdgeKey:
+    """Return the request transfer plus concrete TP edge identity."""
+    return (
+        value.transfer_id,
+        value.producer_engine_id,
+        value.producer_rank,
+        value.consumer_engine_id,
+        value.consumer_rank,
+    )
 
 
 def _positive_int(name: str, value: Any) -> int:
@@ -34,6 +50,30 @@ def _positive_int(name: str, value: Any) -> int:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer") from exc
     if parsed <= 0 or parsed != value:
+        raise ValueError(f"{name} must be positive")
+    return parsed
+
+
+def _non_negative_int(name: str, value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if parsed < 0 or parsed != value:
+        raise ValueError(f"{name} must be non-negative")
+    return parsed
+
+
+def _positive_float(name: str, value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
         raise ValueError(f"{name} must be positive")
     return parsed
 
@@ -66,21 +106,43 @@ class StagingConfig:
             enabled = enabled_value.lower() == "true"
         else:
             raise ValueError("staging_enabled must be a boolean")
-        buffer_bytes = int(extra_config.get("staging_buffer_bytes", 0))
-        buffer_fraction = float(extra_config.get("staging_buffer_fraction", 0.0))
-        slot_bytes = int(extra_config.get("staging_slot_bytes", _DEFAULT_SLOT_BYTES))
-        max_inflight = int(extra_config.get("staging_max_inflight", 1))
-        max_inflight_per_peer = int(
-            extra_config.get("staging_max_inflight_per_peer", 1)
+        buffer_bytes = _non_negative_int(
+            "staging_buffer_bytes", extra_config.get("staging_buffer_bytes", 0)
         )
-        max_ready_per_request = int(
-            extra_config.get("staging_max_ready_per_request", 1)
+        fraction_value = extra_config.get("staging_buffer_fraction", 0.0)
+        if isinstance(fraction_value, bool):
+            raise ValueError("staging_buffer_fraction must be a number")
+        try:
+            buffer_fraction = float(fraction_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("staging_buffer_fraction must be a number") from exc
+        slot_bytes = _positive_int(
+            "staging_slot_bytes",
+            extra_config.get("staging_slot_bytes", _DEFAULT_SLOT_BYTES),
         )
-        ready_retry_interval = float(
-            extra_config.get("staging_ready_retry_interval", 0.5)
+        max_inflight = _positive_int(
+            "staging_max_inflight", extra_config.get("staging_max_inflight", 1)
         )
-        transfer_timeout = float(extra_config.get("staging_transfer_timeout", 30.0))
-        quarantine_max_bytes = int(extra_config.get("staging_quarantine_max_bytes", 0))
+        max_inflight_per_peer = _positive_int(
+            "staging_max_inflight_per_peer",
+            extra_config.get("staging_max_inflight_per_peer", 1),
+        )
+        max_ready_per_request = _positive_int(
+            "staging_max_ready_per_request",
+            extra_config.get("staging_max_ready_per_request", 1),
+        )
+        ready_retry_interval = _positive_float(
+            "staging_ready_retry_interval",
+            extra_config.get("staging_ready_retry_interval", 0.5),
+        )
+        transfer_timeout = _positive_float(
+            "staging_transfer_timeout",
+            extra_config.get("staging_transfer_timeout", 30.0),
+        )
+        quarantine_max_bytes = _non_negative_int(
+            "staging_quarantine_max_bytes",
+            extra_config.get("staging_quarantine_max_bytes", 0),
+        )
         fallback = extra_config.get("staging_fallback", "direct")
 
         if fallback not in ("direct", "fail"):
@@ -97,22 +159,8 @@ class StagingConfig:
                 f"staging_slot_bytes must be at least {_SLOT_ALIGNMENT} bytes"
             )
         slot_bytes -= slot_bytes % _SLOT_ALIGNMENT
-        if buffer_bytes < 0:
-            raise ValueError("staging_buffer_bytes must be non-negative")
         if enabled and buffer_bytes and buffer_bytes < slot_bytes:
             raise ValueError("staging_buffer_bytes must be at least staging_slot_bytes")
-        for name, value in (
-            ("staging_max_inflight", max_inflight),
-            ("staging_max_inflight_per_peer", max_inflight_per_peer),
-            ("staging_max_ready_per_request", max_ready_per_request),
-        ):
-            _positive_int(name, value)
-        if ready_retry_interval <= 0:
-            raise ValueError("staging_ready_retry_interval must be positive")
-        if transfer_timeout <= 0:
-            raise ValueError("staging_transfer_timeout must be positive")
-        if quarantine_max_bytes < 0:
-            raise ValueError("staging_quarantine_max_bytes must be non-negative")
 
         return cls(
             enabled=enabled,
@@ -149,6 +197,51 @@ class StagingConfig:
             buffer_bytes=resolved,
             max_inflight=min(self.max_inflight, resolved // self.slot_bytes),
         )
+
+
+def resolve_staging_config(vllm_config: Any, total_device_bytes: int) -> StagingConfig:
+    """Resolve and persist the per-worker NIXL pull staging reservation."""
+    transfer_config = vllm_config.kv_transfer_config
+    if transfer_config is None or transfer_config.kv_connector not in (
+        "NixlConnector",
+        "NixlPullConnector",
+    ):
+        return StagingConfig()
+    extra_config = transfer_config.kv_connector_extra_config
+    config = StagingConfig.from_extra_config(extra_config)
+    if not config.enabled:
+        return config
+    resolved = config.resolve_buffer_bytes(total_device_bytes)
+    previous = extra_config.get("_staging_resolved_buffer_bytes")
+    if previous is not None and previous != resolved.buffer_bytes:
+        raise ValueError(
+            "staging buffer resolved to different sizes in memory planning and "
+            "connector initialization"
+        )
+    extra_config["_staging_resolved_buffer_bytes"] = resolved.buffer_bytes
+    return resolved
+
+
+def load_resolved_staging_config(vllm_config: Any) -> StagingConfig:
+    """Load the staging config after GPU memory planning resolved its size."""
+    transfer_config = vllm_config.kv_transfer_config
+    if transfer_config is None or transfer_config.kv_connector not in (
+        "NixlConnector",
+        "NixlPullConnector",
+    ):
+        return StagingConfig()
+    extra_config = transfer_config.kv_connector_extra_config
+    config = StagingConfig.from_extra_config(extra_config)
+    if not config.enabled:
+        return config
+    resolved = extra_config.get("_staging_resolved_buffer_bytes")
+    if resolved is None:
+        raise RuntimeError(
+            "NIXL staging memory was not reserved before connector initialization"
+        )
+    return replace(
+        config, buffer_bytes=_positive_int("resolved staging bytes", resolved)
+    )
 
 
 class StageReady(  # type: ignore[call-arg]
@@ -272,13 +365,15 @@ class StagingTransferIntent(msgspec.Struct, frozen=True):  # type: ignore[call-a
     source_ranges_by_group: tuple[tuple[tuple[int, int], ...], ...] = ()
 
     @property
-    def dedup_key(self) -> tuple[str, str, str, str, str]:
+    def dedup_key(self) -> tuple[str, str, str, int, str, int, str]:
         return (
             self.producer_generation,
             self.consumer_generation,
-            self.transfer_id,
             self.producer_engine_id,
+            self.producer_rank,
             self.consumer_engine_id,
+            self.consumer_rank,
+            self.transfer_id,
         )
 
 
@@ -317,6 +412,31 @@ class StageModeQuery(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
 ModeDecision: TypeAlias = StageModeCommit | StageModeAbort
 
 
+def _validate_mode_decision(decision: ModeDecision) -> None:
+    if not decision.transfer_id:
+        raise ValueError("Mode decision transfer_id must not be empty")
+    if decision.mode_attempt < 0:
+        raise ValueError("Mode decision attempt must be non-negative")
+    if not isinstance(decision, StageModeCommit):
+        return
+    if not decision.edges:
+        raise ValueError("Mode commit edges must not be empty")
+    identities = [edge[:4] for edge in decision.edges]
+    if len(identities) != len(set(identities)):
+        raise ValueError("Mode commit edges must be unique")
+    for (
+        producer_engine,
+        producer_rank,
+        consumer_engine,
+        consumer_rank,
+        size,
+    ) in decision.edges:
+        if not producer_engine or not consumer_engine:
+            raise ValueError("Mode commit edges must identify both engines")
+        if min(producer_rank, consumer_rank) < 0 or size <= 0:
+            raise ValueError("Mode commit edge ranks and size are invalid")
+
+
 class ModeDecisionLedger:
     """Worker-side idempotent acceptance of durable Router decisions."""
 
@@ -326,6 +446,7 @@ class ModeDecisionLedger:
         self._committed: dict[str, StageModeCommit] = {}
 
     def accept(self, decision: ModeDecision) -> bool:
+        _validate_mode_decision(decision)
         committed = self._committed.get(decision.transfer_id)
         if committed is not None:
             if committed == decision:
@@ -356,8 +477,10 @@ class IntentLedger:
     """Idempotently retain immutable Router intents and cancellation tombstones."""
 
     def __init__(self) -> None:
-        self._intents: dict[tuple[str, str, str, str, str], StagingTransferIntent] = {}
-        self._cancelled: set[tuple[str, str, str, str, str]] = set()
+        self._intents: dict[
+            tuple[str, str, str, int, str, int, str], StagingTransferIntent
+        ] = {}
+        self._cancelled: set[tuple[str, str, str, int, str, int, str]] = set()
 
     def accept(self, intent: StagingTransferIntent) -> bool:
         validate_intent(intent)
@@ -375,7 +498,9 @@ class IntentLedger:
         self._intents.pop(intent.dedup_key, None)
         self._cancelled.add(intent.dedup_key)
 
-    def get(self, key: tuple[str, str, str, str, str]) -> StagingTransferIntent | None:
+    def get(
+        self, key: tuple[str, str, str, int, str, int, str]
+    ) -> StagingTransferIntent | None:
         return self._intents.get(key)
 
 
@@ -431,6 +556,7 @@ class InMemoryModeStore:
         return self._decisions.get((transfer_id, mode_attempt))
 
     def save(self, decision: ModeDecision) -> None:
+        _validate_mode_decision(decision)
         key = (decision.transfer_id, decision.mode_attempt)
         current = self._decisions.get(key)
         if current is not None and current != decision:
@@ -448,6 +574,15 @@ class ModeCoordinator:
         ] = {}
 
     def record_prepared(self, prepared: StageModePrepared) -> bool:
+        if (
+            not prepared.transfer_id
+            or not prepared.engine_id
+            or not prepared.generation
+            or not prepared.peer_engine_id
+            or min(prepared.mode_attempt, prepared.rank, prepared.peer_rank) < 0
+            or prepared.slot_bytes <= 0
+        ):
+            raise ValueError("Invalid STAGE_MODE_PREPARED")
         decision = self._store.load(prepared.transfer_id, prepared.mode_attempt)
         if decision is not None:
             return False
@@ -750,6 +885,199 @@ class StagingCopyPlan:
         return cls(plan_id, total_bytes, slot_bytes, tuple(chunks))
 
 
+class StagingTransferSession:
+    """Freeze one transfer's mode and local copy plan before data movement."""
+
+    def __init__(self, intent: StagingTransferIntent) -> None:
+        validate_intent(intent)
+        self.intent = intent
+        self._decision: ModeDecision | None = None
+        self._plan: StagingCopyPlan | None = None
+
+    @property
+    def edge_key(self) -> TransferEdgeKey:
+        return transfer_edge_key(self.intent)
+
+    @property
+    def decision(self) -> ModeDecision | None:
+        return self._decision
+
+    @property
+    def plan(self) -> StagingCopyPlan | None:
+        return self._plan
+
+    def accept_decision(self, decision: ModeDecision) -> bool:
+        """Accept one immutable Router decision for the intent's attempt."""
+        _validate_mode_decision(decision)
+        if (
+            decision.transfer_id != self.intent.transfer_id
+            or decision.mode_attempt != self.intent.mode_attempt
+        ):
+            raise RuntimeError("Mode decision does not match the transfer intent")
+        if self._decision is not None:
+            if self._decision != decision:
+                raise RuntimeError("Conflicting staging mode decision")
+            return False
+        self._decision = decision
+        return True
+
+    def freeze_plan(self, plan: StagingCopyPlan) -> bool:
+        """Freeze chunk geometry after a staged commit, before gather or READ."""
+        decision = self._decision
+        if not isinstance(decision, StageModeCommit) or decision.mode != "staged":
+            raise RuntimeError("A staged MODE_COMMIT is required before planning")
+        if plan.plan_id != self.intent.plan_id:
+            raise RuntimeError("Copy plan ID does not match the transfer intent")
+        wire_chunk_bytes = committed_wire_chunk_bytes(self.intent, decision)
+        if plan.slot_bytes != wire_chunk_bytes:
+            raise RuntimeError("Copy plan does not use the committed chunk geometry")
+        if self._plan is not None:
+            if self._plan != plan:
+                raise RuntimeError("Copy plan changed after it was frozen")
+            return False
+        self._plan = plan
+        return True
+
+    def validate_ready(self, ready: StageReady) -> StagingChunk:
+        """Validate READY against the frozen intent, edge, and chunk plan."""
+        _validate_stage_message(ready)
+        plan = self._plan
+        if plan is None:
+            raise RuntimeError("READY arrived before the copy plan was frozen")
+        intent = self.intent
+        if (
+            ready.producer_generation != intent.producer_generation
+            or ready.consumer_generation != intent.consumer_generation
+            or ready.transfer_id != intent.transfer_id
+            or ready.request_id != intent.producer_request_id
+            or ready.plan_id != intent.plan_id
+            or ready.producer_engine_id != intent.producer_engine_id
+            or ready.producer_rank != intent.producer_rank
+            or ready.consumer_engine_id != intent.consumer_engine_id
+            or ready.consumer_rank != intent.consumer_rank
+        ):
+            raise RuntimeError("READY does not match the committed transfer intent")
+        if ready.chunk_index >= len(plan.chunks):
+            raise RuntimeError("READY chunk index is outside the copy plan")
+        chunk = plan.chunks[ready.chunk_index]
+        if ready.valid_bytes != chunk.valid_bytes:
+            raise RuntimeError("READY valid length does not match the copy plan")
+        return chunk
+
+
+class StagingSessionRegistry:
+    """Bound worker-local registry for committed transfer sessions."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[TransferEdgeKey, StagingTransferSession] = {}
+        self._terminal: dict[TransferEdgeKey, tuple[str, str]] = {}
+
+    def register(self, intent: StagingTransferIntent) -> StagingTransferSession:
+        validate_intent(intent)
+        key = transfer_edge_key(intent)
+        current = self._sessions.get(key)
+        if current is not None:
+            if current.intent != intent:
+                raise RuntimeError("A transfer ID cannot be rebound to another peer")
+            return current
+        if key in self._terminal:
+            raise RuntimeError("A terminal transfer edge cannot be reused")
+        session = StagingTransferSession(intent)
+        self._sessions[key] = session
+        return session
+
+    def get(self, transfer_id: str) -> StagingTransferSession | None:
+        matches = self.for_transfer(transfer_id)
+        return matches[0] if len(matches) == 1 else None
+
+    def get_for_ready(self, ready: StageReady) -> StagingTransferSession | None:
+        return self._sessions.get(transfer_edge_key(ready))
+
+    def for_transfer(self, transfer_id: str) -> tuple[StagingTransferSession, ...]:
+        return tuple(
+            session for key, session in self._sessions.items() if key[0] == transfer_id
+        )
+
+    def require_ready(self, ready: StageReady) -> StagingChunk:
+        session = self.get_for_ready(ready)
+        if session is None:
+            raise RuntimeError("READY belongs to an unknown transfer")
+        return session.validate_ready(ready)
+
+    def retire_edge(self, key: TransferEdgeKey) -> None:
+        session = self._sessions.pop(key, None)
+        if session is not None:
+            self._terminal[key] = (
+                session.intent.producer_generation,
+                session.intent.consumer_generation,
+            )
+
+    def retire(self, transfer_id: str) -> None:
+        for session in self.for_transfer(transfer_id):
+            self.retire_edge(session.edge_key)
+
+    def retire_generation(
+        self, producer_generation: str, consumer_generation: str
+    ) -> None:
+        """Bound intent tombstones after a certified generation teardown."""
+        generations = (producer_generation, consumer_generation)
+        for key, session in list(self._sessions.items()):
+            if (
+                session.intent.producer_generation,
+                session.intent.consumer_generation,
+            ) == generations:
+                del self._sessions[key]
+        for key, terminal_generations in list(self._terminal.items()):
+            if terminal_generations == generations:
+                del self._terminal[key]
+
+
+class TransferCompletionTracker:
+    """Report receive completion only after every planned scatter finishes."""
+
+    def __init__(self) -> None:
+        self._expected: dict[str, int] = {}
+        self._scattered: dict[str, set[int]] = {}
+        self._reported: set[str] = set()
+        self._failed: set[str] = set()
+
+    def register(self, transfer_id: str, chunk_count: int) -> None:
+        _positive_int("chunk_count", chunk_count)
+        current = self._expected.get(transfer_id)
+        if current is not None and current != chunk_count:
+            raise RuntimeError("Transfer chunk count changed after registration")
+        self._expected[transfer_id] = chunk_count
+        self._scattered.setdefault(transfer_id, set())
+
+    def fail(self, transfer_id: str) -> None:
+        self._failed.add(transfer_id)
+
+    def retire(self, transfer_id: str) -> None:
+        self._expected.pop(transfer_id, None)
+        self._scattered.pop(transfer_id, None)
+        self._reported.discard(transfer_id)
+        self._failed.discard(transfer_id)
+
+    def is_registered(self, transfer_id: str) -> bool:
+        return transfer_id in self._expected
+
+    def observe_scatter(self, ready: StageReady, tracker_id: str | None = None) -> bool:
+        tracker_id = ready.transfer_id if tracker_id is None else tracker_id
+        expected = self._expected.get(tracker_id)
+        if expected is None:
+            raise RuntimeError("Scatter belongs to an unregistered transfer")
+        if not 0 <= ready.chunk_index < expected:
+            raise RuntimeError("Scatter chunk index is outside the transfer plan")
+        self._scattered[tracker_id].add(ready.chunk_index)
+        if tracker_id in self._failed:
+            return False
+        complete = len(self._scattered[tracker_id]) == expected
+        if not complete or tracker_id in self._reported:
+            return False
+        self._reported.add(tracker_id)
+        return True
+
+
 def committed_wire_chunk_bytes(
     intent: StagingTransferIntent,
     commit: StageModeCommit,
@@ -895,7 +1223,7 @@ class RemoteChunkState(str, Enum):
 
 
 SlotState: TypeAlias = ProducerSlotState | ConsumerSlotState
-SlotOwner: TypeAlias = tuple[str, int]
+SlotOwner: TypeAlias = tuple[Hashable, int]
 
 
 @dataclass
@@ -1114,7 +1442,7 @@ class FairReadyQueue:
         if max_ready_per_request is not None:
             _positive_int("max_ready_per_request", max_ready_per_request)
         self.max_ready_per_request = max_ready_per_request
-        self._queues: OrderedDict[str, OrderedDict[str, deque[StageReady]]] = (
+        self._queues: OrderedDict[Hashable, OrderedDict[str, deque[StageReady]]] = (
             OrderedDict()
         )
         self._keys: set[tuple[Any, ...]] = set()
@@ -1123,7 +1451,7 @@ class FairReadyQueue:
     def identity(message: StageReady) -> tuple[Any, ...]:
         return ready_identity(message)
 
-    def push(self, producer: str, message: StageReady) -> bool:
+    def push(self, producer: Hashable, message: StageReady) -> bool:
         key = self.identity(message)
         if key in self._keys:
             return False
@@ -1158,7 +1486,7 @@ class FairReadyQueue:
                 del self._queues[producer]
         return removed
 
-    def pop(self) -> tuple[str, StageReady] | None:
+    def pop(self) -> tuple[Hashable, StageReady] | None:
         if not self._queues:
             return None
         producer, requests = self._queues.popitem(last=False)
@@ -1512,6 +1840,7 @@ class DescriptorCache(Generic[CacheKeyT, CacheValueT]):
 @dataclass
 class _ExposedChunk:
     ready: StageReady
+    first_ready_attempt: float | None = None
     last_ready_attempt: float | None = None
     inflight_proven: bool = False
 
@@ -1528,6 +1857,7 @@ class ProducerProgress:
         producer_rank: int,
         producer_generation: str,
         ready_retry_interval: float,
+        sessions: StagingSessionRegistry | None = None,
     ) -> None:
         if not pool.producer:
             raise ValueError("ProducerProgress requires a producer slot pool")
@@ -1538,6 +1868,7 @@ class ProducerProgress:
         self.producer_rank = producer_rank
         self.producer_generation = producer_generation
         self.ready_retry_interval = ready_retry_interval
+        self.sessions = sessions
         self._chunks: dict[ReadyIdentity, _ExposedChunk] = {}
         self._slot_chunks: dict[int, set[ReadyIdentity]] = {}
         self._slot_consumers: dict[int, set[ConsumerIdentity]] = {}
@@ -1556,6 +1887,8 @@ class ProducerProgress:
         keys: set[ReadyIdentity] = set()
         for ready in ready_messages:
             _validate_stage_message(ready)
+            if self.sessions is not None:
+                self.sessions.require_ready(ready)
             if (
                 ready.producer_engine_id != self.producer_engine_id
                 or ready.producer_rank != self.producer_rank
@@ -1576,7 +1909,13 @@ class ProducerProgress:
                 raise RuntimeError("Duplicate consumer for producer source slot")
             consumers.add(consumer)
             key = ready_identity(ready)
+            if key in self._chunks:
+                raise RuntimeError("READY is already registered")
             keys.add(key)
+        if first.source_slot_id in self._slot_chunks:
+            raise RuntimeError("Source slot already has registered READY messages")
+        for ready in ready_messages:
+            key = ready_identity(ready)
             self._chunks[key] = _ExposedChunk(ready)
         self._slot_chunks[first.source_slot_id] = keys
         self._slot_consumers[first.source_slot_id] = consumers
@@ -1601,6 +1940,8 @@ class ProducerProgress:
                     exposed.ready.source_slot_id,
                     self._slot_consumers[exposed.ready.source_slot_id],
                 )
+            if exposed.first_ready_attempt is None:
+                exposed.first_ready_attempt = now
             exposed.last_ready_attempt = now
             attempts += 1
             send(exposed.ready, encode_stage_message(exposed.ready))
@@ -1624,7 +1965,19 @@ class ProducerProgress:
             return False
         return False
 
-    def status_queries(self) -> tuple[StageStatusQuery, ...]:
+    def status_queries(
+        self,
+        now: float | None = None,
+        timeout: float | None = None,
+    ) -> tuple[StageStatusQuery, ...]:
+        """Build reconciliation queries, optionally only for timed-out chunks."""
+        if (now is None) != (timeout is None):
+            raise ValueError("now and timeout must be provided together")
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
+        filter_timed_out = now is not None
+        query_now = 0.0 if now is None else now
+        query_timeout = 0.0 if timeout is None else timeout
         return tuple(
             StageStatusQuery(
                 protocol_version=ready.protocol_version,
@@ -1639,7 +1992,13 @@ class ProducerProgress:
                 consumer_engine_id=ready.consumer_engine_id,
                 consumer_rank=ready.consumer_rank,
             )
-            for ready in (chunk.ready for chunk in self._chunks.values())
+            for chunk in self._chunks.values()
+            if not filter_timed_out
+            or (
+                chunk.first_ready_attempt is not None
+                and query_now - chunk.first_ready_attempt >= query_timeout
+            )
+            for ready in (chunk.ready,)
         )
 
     def cancel_transfer(self, transfer_id: str) -> tuple[StageStatusQuery, ...]:
@@ -1679,6 +2038,27 @@ class ProducerProgress:
                 )
         return tuple(exposed_queries)
 
+    def cleanup_consumer_generation(
+        self,
+        consumer_engine_id: str,
+        consumer_generation: str,
+        teardown_barrier: Callable[[], None],
+    ) -> int:
+        """Release a lost consumer only after a certified teardown barrier."""
+        teardown_barrier()
+        released_slots = 0
+        matching = [
+            (key, exposed.ready)
+            for key, exposed in self._chunks.items()
+            if exposed.ready.consumer_engine_id == consumer_engine_id
+            and exposed.ready.consumer_generation == consumer_generation
+            and self.pool._get(exposed.ready.source_slot_id).state
+            == ProducerSlotState.EXPOSED
+        ]
+        for key, ready in matching:
+            released_slots += self._release_consumer(key, ready)
+        return released_slots
+
     def _release_consumer(self, key: ReadyIdentity, ready: StageReady) -> bool:
         consumer = (
             ready.consumer_engine_id,
@@ -1696,9 +2076,275 @@ class ProducerProgress:
             del self._slot_consumers[ready.source_slot_id]
         return released
 
+    def has_transfer(self, transfer_id: str) -> bool:
+        """Whether a transfer still owns an exposed source-slot reference."""
+        return any(
+            chunk.ready.transfer_id == transfer_id for chunk in self._chunks.values()
+        )
+
+
+@dataclass
+class _ProducerGather:
+    session: StagingTransferSession
+    chunk: StagingChunk
+    slot_id: int
+    done: Callable[[], bool]
+
+
+class ProducerPipeline:
+    """Fairly gather committed transfers into a bounded producer outbox."""
+
+    def __init__(
+        self,
+        pool: StagingSlotPool,
+        config: StagingConfig,
+        producer_engine_id: str,
+        producer_rank: int,
+        producer_generation: str,
+        sessions: StagingSessionRegistry | None = None,
+    ) -> None:
+        if not pool.producer:
+            raise ValueError("ProducerPipeline requires a producer slot pool")
+        self.pool = pool
+        self.config = config
+        self.sessions = sessions
+        self.progress = ProducerProgress(
+            pool,
+            producer_engine_id,
+            producer_rank,
+            producer_generation,
+            config.ready_retry_interval,
+            sessions,
+        )
+        self._pending: OrderedDict[TransferEdgeKey, deque[int]] = OrderedDict()
+        self._sessions: dict[TransferEdgeKey, StagingTransferSession] = {}
+        self._packing: dict[int, _ProducerGather] = {}
+        self._gathered: dict[TransferEdgeKey, set[int]] = {}
+        self._stable_edges: set[TransferEdgeKey] = set()
+        self._reported_stable: set[str] = set()
+        self._cancelled: set[str] = set()
+        self.failed_transfers: set[str] = set()
+
+    def register_transfer(self, session: StagingTransferSession) -> None:
+        """Queue every chunk of a frozen, single-edge producer plan."""
+        plan = session.plan
+        if plan is None:
+            raise RuntimeError("Transfer plan must be frozen before registration")
+        intent = session.intent
+        if (
+            intent.producer_engine_id != self.progress.producer_engine_id
+            or intent.producer_rank != self.progress.producer_rank
+            or intent.producer_generation != self.progress.producer_generation
+        ):
+            raise RuntimeError("Transfer intent does not identify this producer")
+        edge_key = session.edge_key
+        current = self._sessions.get(edge_key)
+        if current is not None:
+            if current is not session and current.intent != intent:
+                raise RuntimeError("Conflicting producer transfer session")
+            return
+        if not plan.chunks:
+            self._stable_edges.add(edge_key)
+            self._sessions[edge_key] = session
+            return
+        if self.sessions is not None:
+            registered = self.sessions.register(intent)
+            if registered is not session:
+                decision = session.decision
+                assert decision is not None
+                registered.accept_decision(decision)
+                registered.freeze_plan(plan)
+                session = registered
+        edge_key = session.edge_key
+        self._sessions[edge_key] = session
+        self._pending[edge_key] = deque(range(len(plan.chunks)))
+        self._gathered[edge_key] = set()
+
+    def _active_count(self, transfer_id: str) -> int:
+        return sum(
+            slot.owner is not None
+            and isinstance(slot.owner[0], tuple)
+            and slot.owner[0][0] == transfer_id
+            for slot in self.pool.slots
+        )
+
+    def start_available(
+        self,
+        start_gather: Callable[
+            [StagingTransferSession, StagingChunk, int], Callable[[], bool]
+        ],
+    ) -> int:
+        """Start fair gathers until the pool or per-request limit is full."""
+        started = 0
+        candidates = len(self._pending)
+        while self._pending and candidates:
+            edge_key, chunks = self._pending.popitem(last=False)
+            transfer_id = edge_key[0]
+            candidates -= 1
+            if transfer_id in self._cancelled:
+                continue
+            if self._active_count(transfer_id) >= self.config.max_ready_per_request:
+                self._pending[edge_key] = chunks
+                continue
+            chunk_index = chunks.popleft()
+            session = self._sessions[edge_key]
+            plan = session.plan
+            assert plan is not None
+            chunk = plan.chunks[chunk_index]
+            slot = self.pool.acquire((edge_key, chunk_index))
+            if slot is None:
+                chunks.appendleft(chunk_index)
+                self._pending[edge_key] = chunks
+                break
+            try:
+                done = start_gather(session, chunk, slot.slot_id)
+            except Exception:
+                self.pool.quarantine(slot.slot_id)
+                self.failed_transfers.add(transfer_id)
+                self._cancelled.add(transfer_id)
+                continue
+            self._packing[slot.slot_id] = _ProducerGather(
+                session, chunk, slot.slot_id, done
+            )
+            if chunks:
+                self._pending[edge_key] = chunks
+            started += 1
+            candidates = max(candidates, len(self._pending))
+        return started
+
+    def poll_gathers(self) -> tuple[StageReady, ...]:
+        """Publish READY only after gather completion; drain cancelled gathers."""
+        ready_messages: list[StageReady] = []
+        for slot_id, gather in list(self._packing.items()):
+            try:
+                done = gather.done()
+            except Exception:
+                self.pool.quarantine(slot_id)
+                del self._packing[slot_id]
+                transfer_id = gather.session.intent.transfer_id
+                self.failed_transfers.add(transfer_id)
+                self._cancelled.add(transfer_id)
+                continue
+            if not done:
+                continue
+            del self._packing[slot_id]
+            intent = gather.session.intent
+            if intent.transfer_id in self._cancelled:
+                self.pool.release(slot_id)
+                if not any(
+                    pending.session.intent.transfer_id == intent.transfer_id
+                    for pending in self._packing.values()
+                ):
+                    for edge_key in self._sessions:
+                        if edge_key[0] == intent.transfer_id:
+                            self._stable_edges.add(edge_key)
+                continue
+            self.pool.transition(
+                slot_id,
+                ProducerSlotState.PACKING,
+                ProducerSlotState.READY_LOCAL,
+            )
+            slot = self.pool._get(slot_id)
+            ready = StageReady(
+                protocol_version=intent.protocol_version,
+                producer_generation=intent.producer_generation,
+                consumer_generation=intent.consumer_generation,
+                transfer_id=intent.transfer_id,
+                request_id=intent.producer_request_id,
+                chunk_index=gather.chunk.index,
+                source_slot_id=slot_id,
+                source_slot_epoch=slot.epoch,
+                valid_bytes=gather.chunk.valid_bytes,
+                plan_id=intent.plan_id,
+                producer_engine_id=intent.producer_engine_id,
+                producer_rank=intent.producer_rank,
+                consumer_engine_id=intent.consumer_engine_id,
+                consumer_rank=intent.consumer_rank,
+            )
+            self.progress.add_ready((ready,))
+            ready_messages.append(ready)
+            edge_key = gather.session.edge_key
+            gathered = self._gathered[edge_key]
+            gathered.add(gather.chunk.index)
+            plan = gather.session.plan
+            assert plan is not None
+            if len(gathered) == len(plan.chunks):
+                self._stable_edges.add(edge_key)
+        return tuple(ready_messages)
+
+    def send_ready(
+        self,
+        send: Callable[[StageReady, bytes], None],
+        now: float | None = None,
+    ) -> int:
+        return self.progress.send_ready(send, now)
+
+    def cancel_transfer(self, transfer_id: str) -> tuple[StageStatusQuery, ...]:
+        """Cancel queued work and safely reconcile exposed source slots."""
+        self._cancelled.add(transfer_id)
+        for edge_key in tuple(self._pending):
+            if edge_key[0] == transfer_id:
+                del self._pending[edge_key]
+        if not any(
+            gather.session.intent.transfer_id == transfer_id
+            for gather in self._packing.values()
+        ):
+            self._stable_edges.update(
+                key for key in self._sessions if key[0] == transfer_id
+            )
+        return self.progress.cancel_transfer(transfer_id)
+
+    def pop_source_stable(self) -> set[str]:
+        """Return requests whose source KV lease no longer blocks new gathers."""
+        stable = {
+            key[0]
+            for key in self._stable_edges
+            if key[0] not in self._reported_stable
+            and all(
+                candidate in self._stable_edges
+                for candidate in self._sessions
+                if candidate[0] == key[0]
+            )
+        }
+        self._reported_stable.update(stable)
+        return stable
+
+    def pop_completed_transfers(self) -> set[str]:
+        """Retire transfers after gathers and all remote reads are safe."""
+        completed_edges = {
+            edge_key
+            for edge_key in self._sessions
+            if edge_key in self._stable_edges
+            and edge_key not in self._pending
+            and not self.progress.has_transfer(edge_key[0])
+            and not any(
+                gather.session.edge_key == edge_key for gather in self._packing.values()
+            )
+        }
+        candidate_transfers = {key[0] for key in completed_edges}
+        for edge_key in completed_edges:
+            del self._sessions[edge_key]
+            self._gathered.pop(edge_key, None)
+            self._stable_edges.discard(edge_key)
+            if self.sessions is not None:
+                self.sessions.retire_edge(edge_key)
+        return {
+            transfer_id
+            for transfer_id in candidate_transfers
+            if not any(key[0] == transfer_id for key in self._sessions)
+        }
+
 
 class DefinitelyNotSubmittedError(RuntimeError):
     """A READ post failed with proof that the backend never submitted it."""
+
+
+class PossiblySubmittedError(RuntimeError):
+    """A READ post failed after creating a handle; submission is unknown."""
+
+    def __init__(self, handle: Hashable, message: str) -> None:
+        super().__init__(message)
+        self.handle = handle
 
 
 class ReadBackend(Protocol):
@@ -1733,6 +2379,7 @@ class ConsumerProgress:
         consumer_engine_id: str,
         consumer_rank: int,
         consumer_generation: str,
+        sessions: StagingSessionRegistry | None = None,
     ) -> None:
         if pool.producer:
             raise ValueError("ConsumerProgress requires a consumer slot pool")
@@ -1741,18 +2388,52 @@ class ConsumerProgress:
         self.consumer_engine_id = consumer_engine_id
         self.consumer_rank = consumer_rank
         self.consumer_generation = consumer_generation
+        self.sessions = sessions
         self.ready = FairReadyQueue(config.max_ready_per_request)
         self.ledger = ChunkLedger()
         self.completions = ReadCompletionOutbox(self.ledger)
         self._reads: dict[Hashable, _ConsumerRead] = {}
+        self._unknown_reads: dict[Hashable, _ConsumerRead] = {}
         self._scatters: dict[int, _ConsumerScatter] = {}
-        self._inflight_per_peer: dict[str, int] = {}
+        self._inflight_per_peer: dict[ProducerIdentity, int] = {}
         self._quarantined_by_peer: dict[str, set[int]] = {}
         self._cancelled_transfers: set[str] = set()
         self.unavailable_peers: set[str] = set()
+        self.completion_tracker = TransferCompletionTracker()
+        self.failed_transfers: set[str] = set()
+        self._completed_edges: set[TransferEdgeKey] = set()
+
+    @staticmethod
+    def _peer_identity(message: StageReady) -> ProducerIdentity:
+        return (
+            message.producer_engine_id,
+            message.producer_rank,
+            message.producer_generation,
+        )
+
+    def register_transfer(self, session: StagingTransferSession) -> None:
+        """Register the frozen destination plan used for request completion."""
+        plan = session.plan
+        if plan is None:
+            raise RuntimeError("Transfer plan must be frozen before registration")
+        if self.sessions is not None:
+            registered = self.sessions.register(session.intent)
+            if registered is not session:
+                if registered.intent != session.intent:
+                    raise RuntimeError("Conflicting transfer session")
+                decision = session.decision
+                assert decision is not None
+                registered.accept_decision(decision)
+                registered.freeze_plan(plan)
+        if plan.chunks:
+            self.completion_tracker.register(repr(session.edge_key), len(plan.chunks))
+        else:
+            self._completed_edges.add(session.edge_key)
 
     def receive_ready(self, message: StageReady) -> bool:
         _validate_stage_message(message)
+        if self.sessions is not None:
+            self.sessions.require_ready(message)
         if (
             message.consumer_engine_id != self.consumer_engine_id
             or message.consumer_rank != self.consumer_rank
@@ -1768,7 +2449,7 @@ class ConsumerProgress:
             return False
         if state != RemoteChunkState.QUEUED:
             return False
-        return self.ready.push(message.producer_engine_id, message)
+        return self.ready.push(self._peer_identity(message), message)
 
     def post_available(self, backend: ReadBackend) -> int:
         posted = 0
@@ -1778,16 +2459,18 @@ class ConsumerProgress:
             if queued is None:
                 break
             candidates -= 1
-            peer, message = queued
+            peer_key, message = queued
+            assert isinstance(peer_key, tuple) and len(peer_key) == 3
+            peer = message.producer_engine_id
             if (
-                self._inflight_per_peer.get(peer, 0)
+                self._inflight_per_peer.get(peer_key, 0)
                 >= self.config.max_inflight_per_peer
             ):
-                self.ready.push(peer, message)
+                self.ready.push(peer_key, message)
                 continue
             slot = self.pool.acquire((message.transfer_id, message.chunk_index))
             if slot is None:
-                self.ready.push(peer, message)
+                self.ready.push(peer_key, message)
                 break
             self.ledger.transition(
                 message, RemoteChunkState.QUEUED, RemoteChunkState.POSTING
@@ -1800,19 +2483,48 @@ class ConsumerProgress:
                 )
                 self.pool.release(slot.slot_id)
                 continue
+            except PossiblySubmittedError as exc:
+                self.ledger.transition(
+                    message, RemoteChunkState.POSTING, RemoteChunkState.UNKNOWN
+                )
+                self.pool.quarantine(slot.slot_id)
+                self._unknown_reads[exc.handle] = _ConsumerRead(
+                    message, slot.slot_id, exc.handle
+                )
+                self._quarantined_by_peer.setdefault(peer, set()).add(slot.slot_id)
+                self.failed_transfers.add(message.transfer_id)
+                self.completion_tracker.fail(repr(transfer_edge_key(message)))
+                self._mark_peer_unavailable(peer)
+                continue
             except Exception:
                 self.ledger.transition(
                     message, RemoteChunkState.POSTING, RemoteChunkState.UNKNOWN
                 )
                 self.pool.quarantine(slot.slot_id)
                 self._quarantined_by_peer.setdefault(peer, set()).add(slot.slot_id)
+                self.failed_transfers.add(message.transfer_id)
+                self.completion_tracker.fail(repr(transfer_edge_key(message)))
                 self._mark_peer_unavailable(peer)
                 continue
             self.ledger.transition(
                 message, RemoteChunkState.POSTING, RemoteChunkState.INFLIGHT
             )
+            try:
+                duplicate_handle = handle in self._reads
+            except TypeError:
+                duplicate_handle = True
+            if duplicate_handle:
+                self.ledger.transition(
+                    message, RemoteChunkState.INFLIGHT, RemoteChunkState.UNKNOWN
+                )
+                self.pool.quarantine(slot.slot_id)
+                self._quarantined_by_peer.setdefault(peer, set()).add(slot.slot_id)
+                self._mark_peer_unavailable(peer)
+                continue
             self._reads[handle] = _ConsumerRead(message, slot.slot_id, handle)
-            self._inflight_per_peer[peer] = self._inflight_per_peer.get(peer, 0) + 1
+            self._inflight_per_peer[peer_key] = (
+                self._inflight_per_peer.get(peer_key, 0) + 1
+            )
             posted += 1
         return posted
 
@@ -1830,9 +2542,11 @@ class ConsumerProgress:
             if state in ("PROC", "INFLIGHT"):
                 continue
             peer = read.ready.producer_engine_id
+            peer_key = self._peer_identity(read.ready)
             if state != "DONE":
-                self._inflight_per_peer[peer] -= 1
+                self._inflight_per_peer[peer_key] -= 1
                 del self._reads[handle]
+                self._unknown_reads[handle] = read
                 self.ledger.transition(
                     read.ready, RemoteChunkState.INFLIGHT, RemoteChunkState.UNKNOWN
                 )
@@ -1840,6 +2554,8 @@ class ConsumerProgress:
                 self._quarantined_by_peer.setdefault(peer, set()).add(
                     read.local_slot_id
                 )
+                self.failed_transfers.add(read.ready.transfer_id)
+                self.completion_tracker.fail(repr(transfer_edge_key(read.ready)))
                 self._mark_peer_unavailable(peer)
                 continue
             try:
@@ -1848,30 +2564,98 @@ class ConsumerProgress:
                 )
             except Exception:
                 continue
-            self._inflight_per_peer[peer] -= 1
+            self._inflight_per_peer[peer_key] -= 1
             del self._reads[handle]
             self.pool.transition(
                 read.local_slot_id,
                 ConsumerSlotState.READING,
                 ConsumerSlotState.SCATTERING,
             )
-            done = start_scatter(read.ready, read.local_slot_id)
+            try:
+                done = start_scatter(read.ready, read.local_slot_id)
+            except Exception:
+                self.pool.quarantine(read.local_slot_id)
+                self._quarantined_by_peer.setdefault(peer, set()).add(
+                    read.local_slot_id
+                )
+                self.failed_transfers.add(read.ready.transfer_id)
+                self.completion_tracker.fail(repr(transfer_edge_key(read.ready)))
+                continue
             self._scatters[read.local_slot_id] = _ConsumerScatter(
                 read.ready, read.local_slot_id, done
             )
             completed += 1
         return completed
 
+    def poll_unknown_reads(self, backend: ReadBackend) -> int:
+        """Reconcile handles whose transfer submission result was unknown."""
+        safely_retired = 0
+        for handle, read in list(self._unknown_reads.items()):
+            try:
+                state = backend.check_read(handle)
+            except Exception:
+                continue
+            if state != "DONE":
+                continue
+            try:
+                self.completions.observe_done(
+                    read.ready, partial(backend.release_read, handle)
+                )
+            except Exception:
+                continue
+            del self._unknown_reads[handle]
+            self.pool.retire_quarantined(read.local_slot_id)
+            self._quarantined_by_peer[read.ready.producer_engine_id].discard(
+                read.local_slot_id
+            )
+            safely_retired += 1
+        return safely_retired
+
     def poll_scatters(self) -> tuple[StageReady, ...]:
         completed: list[StageReady] = []
         for slot_id, scatter in list(self._scatters.items()):
-            if not scatter.done():
+            try:
+                done = scatter.done()
+            except Exception:
+                self.pool.quarantine(slot_id)
+                del self._scatters[slot_id]
+                peer = scatter.ready.producer_engine_id
+                self._quarantined_by_peer.setdefault(peer, set()).add(slot_id)
+                self.failed_transfers.add(scatter.ready.transfer_id)
+                self.completion_tracker.fail(repr(transfer_edge_key(scatter.ready)))
+                continue
+            if not done:
                 continue
             self.pool.release(slot_id)
             del self._scatters[slot_id]
             if scatter.ready.transfer_id not in self._cancelled_transfers:
                 completed.append(scatter.ready)
+                edge_key = transfer_edge_key(scatter.ready)
+                tracker_key = repr(edge_key)
+                if self.completion_tracker.is_registered(
+                    tracker_key
+                ) and self.completion_tracker.observe_scatter(
+                    scatter.ready, tracker_key
+                ):
+                    self._completed_edges.add(edge_key)
         return tuple(completed)
+
+    def pop_completed_transfers(self) -> set[str]:
+        """Return transfers whose complete destination plans were scattered."""
+        completed = self._completed_edges
+        self._completed_edges = set()
+        transfer_ids = {key[0] for key in completed}
+        for edge_key in completed:
+            self.completion_tracker.retire(repr(edge_key))
+            if self.sessions is not None:
+                self.sessions.retire_edge(edge_key)
+        if self.sessions is None:
+            return transfer_ids
+        return {
+            transfer_id
+            for transfer_id in transfer_ids
+            if not self.sessions.for_transfer(transfer_id)
+        }
 
     def cancel_transfer(self, transfer_id: str) -> tuple[StageStatusReply, ...]:
         self._cancelled_transfers.add(transfer_id)
@@ -1882,6 +2666,9 @@ class ConsumerProgress:
         for read in self._reads.values():
             if read.ready.transfer_id == transfer_id:
                 replies.append(self._status_reply(read.ready, "inflight"))
+        for read in self._unknown_reads.values():
+            if read.ready.transfer_id == transfer_id:
+                replies.append(self._status_reply(read.ready, "unknown"))
         return tuple(replies)
 
     def reply_status(self, query: StageStatusQuery) -> StageStatusReply:
@@ -1935,3 +2722,58 @@ class ConsumerProgress:
             self.pool.retire_quarantined(slot_id)
         self.ledger.retire_generation(peer, generation)
         self.unavailable_peers.discard(peer)
+
+
+class StagingNotificationHandler:
+    """Route typed staging notifications without legacy string fallback."""
+
+    def __init__(
+        self,
+        producer: ProducerProgress | None = None,
+        consumer: ConsumerProgress | None = None,
+    ) -> None:
+        if producer is None and consumer is None:
+            raise ValueError("A staging notification handler needs a local role")
+        self.producer = producer
+        self.consumer = consumer
+        self.invalid_notifications = 0
+        self.ignored_notifications = 0
+
+    def receive(self, payload: bytes) -> tuple[StageMessage, ...]:
+        """Apply one notification and return any required control replies."""
+        try:
+            message = decode_stage_message(payload)
+        except ValueError:
+            self.invalid_notifications += 1
+            return ()
+
+        if isinstance(message, StageReady):
+            if self.consumer is None:
+                self.ignored_notifications += 1
+            else:
+                self.consumer.receive_ready(message)
+            return ()
+        if isinstance(message, StageReadComplete):
+            if self.producer is None:
+                self.ignored_notifications += 1
+            else:
+                self.producer.accept_read_complete(message)
+            return ()
+        if isinstance(message, StageStatusReply):
+            if self.producer is None:
+                self.ignored_notifications += 1
+            else:
+                self.producer.accept_status_reply(message)
+            return ()
+        if isinstance(message, StageStatusQuery):
+            if self.consumer is None:
+                self.ignored_notifications += 1
+                return ()
+            return (self.consumer.reply_status(message),)
+
+        replies: list[StageMessage] = []
+        if self.consumer is not None:
+            replies.extend(self.consumer.cancel_transfer(message.transfer_id))
+        if self.producer is not None:
+            replies.extend(self.producer.cancel_transfer(message.transfer_id))
+        return tuple(replies)

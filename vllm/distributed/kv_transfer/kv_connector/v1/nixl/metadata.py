@@ -5,11 +5,18 @@
 from dataclasses import dataclass
 from typing import Any
 
+import msgspec
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.staging import (
+    StageModeCommit,
+    StagingTransferIntent,
+    validate_intent,
 )
 from vllm.logger import init_logger
 
@@ -43,8 +50,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #      clock-sync timestamp
 #   6: Validate EAGLE/MTP speculative configuration compatibility
 #   7: Advertise receiver-pull GPU staging capabilities
+#   8: Add Router staging intent and mode-commit request metadata
 #
-NIXL_CONNECTOR_VERSION: int = 7
+NIXL_CONNECTOR_VERSION: int = 8
 
 
 @dataclass
@@ -242,6 +250,44 @@ class ReqMeta:
     remote_block_size: int | None = None
     # Remote producer pipeline-parallel size (push mode, D side).
     pp_size: int = 1
+    staging_intents: tuple[StagingTransferIntent, ...] = ()
+    staging_mode_commit: StageModeCommit | None = None
+
+
+def _decode_staging_value(value: Any, target_type: Any) -> Any:
+    if isinstance(value, bytes):
+        return msgspec.msgpack.decode(value, type=target_type)
+    return msgspec.convert(value, type=target_type, strict=True)
+
+
+def decode_staging_request_metadata(
+    kv_transfer_params: dict[str, Any],
+) -> tuple[tuple[StagingTransferIntent, ...], StageModeCommit | None]:
+    """Decode and validate Router-provided staging intent and mode commit."""
+    raw_intents = kv_transfer_params.get("staging_transfer_intents", ())
+    if isinstance(raw_intents, (bytes, StagingTransferIntent, dict)):
+        raw_intents = (raw_intents,)
+    intents = tuple(
+        _decode_staging_value(item, StagingTransferIntent) for item in raw_intents
+    )
+    for intent in intents:
+        validate_intent(intent)
+    raw_commit = kv_transfer_params.get("staging_mode_commit")
+    commit = (
+        None
+        if raw_commit is None
+        else _decode_staging_value(raw_commit, StageModeCommit)
+    )
+    if commit is not None:
+        if not intents:
+            raise ValueError("staging_mode_commit requires staging_transfer_intents")
+        if any(
+            intent.transfer_id != commit.transfer_id
+            or intent.mode_attempt != commit.mode_attempt
+            for intent in intents
+        ):
+            raise ValueError("staging intent and mode commit do not match")
+    return intents, commit
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -265,12 +311,14 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        self.staging_reqs_to_send: dict[ReqId, ReqMeta] = {}
 
     def _add_new_req(
         self,
         local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
     ) -> ReqMeta:
+        intents, commit = decode_staging_request_metadata(kv_transfer_params)
         return ReqMeta(
             local_block_ids=local_block_ids,
             local_physical_block_ids=local_block_ids,
@@ -278,6 +326,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             tp_size=kv_transfer_params.get("tp_size", 1),
             remote_block_size=kv_transfer_params.get("remote_block_size"),
             pp_size=kv_transfer_params.get("pp_size", 1),
+            staging_intents=intents,
+            staging_mode_commit=commit,
         )
 
     def add_new_req_to_save(

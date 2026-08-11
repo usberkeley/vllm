@@ -42,6 +42,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     TransferHandle,
     compute_nixl_compatibility_hash,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.staging import (
+    STAGING_PROTOCOL_VERSION,
+    StagingSlotPool,
+    load_resolved_staging_config,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
@@ -266,6 +271,17 @@ class NixlBaseConnectorWorker:
         if vllm_config.kv_transfer_config is None:
             raise ValueError("kv_transfer_config must be set for NixlConnector")
         self.kv_transfer_config = vllm_config.kv_transfer_config
+        self.staging_config = load_resolved_staging_config(vllm_config)
+        self.staging_generation = str(uuid.uuid4())
+        self.staging_pool: StagingSlotPool | None = None
+        self._staging_remote_metadata: dict[EngineId, dict[int, NixlAgentMetadata]] = (
+            defaultdict(dict)
+        )
+        if self.staging_config.enabled:
+            if self.kv_transfer_config.kv_role == "kv_both":
+                raise ValueError("NIXL staging does not support kv_role=kv_both")
+            if vllm_config.parallel_config.pipeline_parallel_size > 1:
+                raise ValueError("NIXL pull staging does not support PP > 1")
 
         self.nixl_backends = vllm_config.kv_transfer_config.get_from_extra_config(
             "backends", ["UCX"]
@@ -379,6 +395,8 @@ class NixlBaseConnectorWorker:
                 "is not supported."
             )
         self.device_kv_caches: dict[str, torch.Tensor] = {}
+        self._staging_regions: tuple[torch.Tensor, ...] = ()
+        self._staging_mamba_regions: tuple[torch.Tensor, ...] = ()
 
         # cpu kv buffer for xfer
         # used when device memory can not be registered under nixl
@@ -417,6 +435,10 @@ class NixlBaseConnectorWorker:
                 "is not supported."
             )
         self.nixl_memory_type = nixl_memory_type
+        if self.staging_config.enabled and (
+            self.use_host_buffer or self.nixl_memory_type != "VRAM"
+        ):
+            raise ValueError("NIXL staging requires a directly registered GPU buffer")
 
         # Note: host xfer buffer ops when use_host_buffer is True
         self.copy_blocks: CopyBlocksOp | None = None
@@ -711,6 +733,9 @@ class NixlBaseConnectorWorker:
                     remote_agent_name = self.add_remote_agent(
                         metadata, remote_rank, remote_tp_size
                     )
+                self._staging_remote_metadata[metadata.engine_id][remote_rank] = (
+                    metadata
+                )
                 setup_agent_time = time.perf_counter()
                 logger.debug(
                     "NIXL handshake: add agent took: %s (notif_agents_only=%s)",
@@ -993,6 +1018,14 @@ class NixlBaseConnectorWorker:
         )
 
         self.device_id = device_id
+        self._staging_regions = (
+            torch.empty(0, dtype=torch.uint8, device=storage.device).set_(
+                storage,
+                0,
+                (self.num_blocks, block_stride),
+                (block_stride, 1),
+            ),
+        )
         caches_data = [(base_addr, total_size, self.device_id, "")]
 
         self.block_len_per_layer = [block_stride]
@@ -1010,6 +1043,8 @@ class NixlBaseConnectorWorker:
             self.register_local_xfer_handler(self.block_size)
         )
 
+        self._register_staging_pool(storage.device)
+
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
@@ -1026,6 +1061,7 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            **self._staging_metadata_fields(),
         )
         assert self.compat_hash is not None
         encoder = msgspec.msgpack.Encoder()
@@ -1092,6 +1128,8 @@ class NixlBaseConnectorWorker:
         )
 
         caches_data = []
+        staging_regions: list[torch.Tensor] = []
+        staging_mamba_regions: list[torch.Tensor] = []
         # With hybrid allocator, layers can share a kv cache tensor
         seen_base_addresses: list[int] = []
 
@@ -1197,6 +1235,28 @@ class NixlBaseConnectorWorker:
             # Torch uses -1 to indicate CPU tensors.
             self.device_id = max(cache.get_device(), 0)
             caches_data.append((base_addr, curr_tensor_size_bytes, self.device_id, ""))
+            storage = cache.untyped_storage()
+            byte_offset = base_addr - storage.data_ptr()
+            staging_regions.append(
+                torch.empty(0, dtype=torch.uint8, device=cache.device).set_(
+                    storage,
+                    byte_offset,
+                    (num_blocks, physical_page_size),
+                    (physical_page_size, 1),
+                )
+            )
+            if self._has_mamba:
+                logical_page_size = (
+                    physical_page_size * self._physical_blocks_per_logical_kv_block
+                )
+                staging_mamba_regions.append(
+                    torch.empty(0, dtype=torch.uint8, device=cache.device).set_(
+                        storage,
+                        byte_offset,
+                        (self._logical_num_blocks, logical_page_size),
+                        (logical_page_size, 1),
+                    )
+                )
 
         logger.debug(
             "Different block lengths collected: %s", set(self.block_len_per_layer)
@@ -1209,6 +1269,8 @@ class NixlBaseConnectorWorker:
 
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
         self.num_regions = len(caches_data)
+        self._staging_regions = tuple(staging_regions)
+        self._staging_mamba_regions = tuple(staging_mamba_regions)
 
         if self.pp_size > 1:
             start_layer, end_layer = self.model_config.get_layers_start_end_indices(
@@ -1250,6 +1312,8 @@ class NixlBaseConnectorWorker:
             self.register_local_xfer_handler(self.block_size)
         )
 
+        self._register_staging_pool(next(iter(kv_caches.values())).device)
+
         # After KV Caches registered, listen for new connections.
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
@@ -1267,6 +1331,7 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            **self._staging_metadata_fields(),
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1275,6 +1340,50 @@ class NixlBaseConnectorWorker:
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
+
+    def _register_staging_pool(self, device: torch.device) -> None:
+        """Allocate and register the memory-planned staging pool once."""
+        if not self.staging_config.enabled:
+            return
+        if self.staging_pool is not None:
+            raise RuntimeError("NIXL staging pool was registered more than once")
+        producer = self.kv_transfer_config.kv_role == "kv_producer"
+        self.staging_pool = StagingSlotPool(
+            self.staging_config.slot_count,
+            self.staging_config.slot_bytes,
+            device=device,
+            producer=producer,
+        )
+        region = self.staging_pool.pool_registration_region(self.device_id)
+        descs = self.nixl_wrapper.get_reg_descs([region], self.nixl_memory_type)
+        self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+        self._registered_descs.append(descs)
+        logger.info(
+            "Registered NIXL staging pool: bytes=%d, slots=%d, slot_bytes=%d",
+            self.staging_pool.usable_bytes,
+            len(self.staging_pool.slots),
+            self.staging_pool.slot_bytes,
+        )
+
+    def _staging_metadata_fields(self) -> dict[str, Any]:
+        if self.staging_pool is None:
+            return {}
+        base, pool_bytes, _, _ = self.staging_pool.pool_registration_region(
+            self.device_id
+        )
+        return {
+            "staging_protocol_version": STAGING_PROTOCOL_VERSION,
+            "staging_generation": self.staging_generation,
+            "staging_pool_base_addr": base,
+            "staging_pool_bytes": pool_bytes,
+            "staging_slot_bytes": self.staging_pool.slot_bytes,
+            "staging_slot_count": len(self.staging_pool.slots),
+            "staging_supported_features": (
+                "receiver_pull",
+                "explicit_read_complete",
+                "status_reconciliation",
+            ),
+        }
 
     def _build_mamba_local(self, base_addresses: list[int]) -> np.ndarray:
         """Build desc regions (conv sub-projections + ssm) per layer for
@@ -2563,6 +2672,9 @@ class NixlBaseConnectorWorker:
         self.kv_caches_base_addr.pop(engine_id, None)
         self.dst_num_blocks.pop(engine_id, None)
         self.tp_mappings.pop(engine_id, None)
+        staging_metadata = getattr(self, "_staging_remote_metadata", None)
+        if staging_metadata is not None:
+            staging_metadata.pop(engine_id, None)
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)
 

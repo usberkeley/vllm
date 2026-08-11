@@ -264,6 +264,16 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # Here we "unpad" blocks to send the actual remote blocks to be read.
             block_ids = self.get_exchange_clipped_blocks(block_ids)
 
+            if (
+                is_p_node
+                and params.get("staging_transfer_intents")
+                and params.get("staging_mode_commit")
+            ):
+                self._staging_reqs_need_send[request.request_id] = (
+                    request,
+                    block_ids,
+                )
+
             remote_num_tokens = request.num_computed_tokens
 
         return delay_free_blocks, dict(

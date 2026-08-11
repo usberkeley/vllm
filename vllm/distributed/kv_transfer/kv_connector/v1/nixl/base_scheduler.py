@@ -108,6 +108,7 @@ class NixlBaseConnectorScheduler:
         self._reqs_need_save: dict[ReqId, Request] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
+        self._staging_reqs_need_send: dict[ReqId, tuple[Request, BlockIds]] = {}
         self._reqs_in_batch: set[ReqId] = set()
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
@@ -453,6 +454,11 @@ class NixlBaseConnectorScheduler:
             self._build_save_meta(meta, scheduler_output)
 
         meta.reqs_to_send = self._reqs_need_send
+        for req_id, (req, block_ids) in self._staging_reqs_need_send.items():
+            assert req.kv_transfer_params is not None
+            meta.staging_reqs_to_send[req_id] = meta._add_new_req(
+                block_ids, req.kv_transfer_params
+            )
         # Clock reference for reqs_to_send: deadlines above are in this
         # process's perf_counter domain; workers (possibly on other nodes,
         # where perf_counter has a different epoch) rebase against this.
@@ -472,6 +478,7 @@ class NixlBaseConnectorScheduler:
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
+        self._staging_reqs_need_send = {}
 
         return meta
 
