@@ -51,6 +51,25 @@ class EngineCoreSamplingParams(msgspec.Struct, dict=True, omit_defaults=True):
     output_kind: RequestOutputKind = RequestOutputKind.DELTA
 
 
+# Mirror of real PoolingParams, including the internal fields the Rust client
+# must skip over to reach `extra_kwargs`.
+class EngineCorePoolingParams(
+    msgspec.Struct,
+    array_like=True,
+    omit_defaults=True,
+):
+    use_activation: bool | None = None
+    dimensions: int | None = None
+    step_tag_id: int | None = None
+    returned_token_ids: list[int] | None = None
+    task: str | None = None
+    requires_token_ids: bool = False
+    skip_reading_prefix_cache: bool | None = None
+    late_interaction_params: object | None = None
+    extra_kwargs: dict[str, object] | None = None
+    output_kind: RequestOutputKind = RequestOutputKind.FINAL_ONLY
+
+
 class EngineCoreRequest(
     msgspec.Struct,
     array_like=True,
@@ -523,3 +542,12 @@ print(
     )
 )
 print(msgspec.msgpack.encode(ready_response).hex())
+print(
+    msgspec.msgpack.encode(
+        EngineCorePoolingParams(
+            use_activation=False,
+            task="classify",
+            extra_kwargs={"compressed_token_type_ids": 3},
+        )
+    ).hex()
+)

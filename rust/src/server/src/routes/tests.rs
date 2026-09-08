@@ -444,11 +444,14 @@ struct FakeChatBackend {
 
 /// Synthetic BOS id used when `add_special_tokens` is true in tests.
 const FAKE_BOS_TOKEN_ID: u32 = 256;
+/// Synthetic separator id joining the two halves of a scored text pair.
+const FAKE_SEP_TOKEN_ID: u32 = 257;
 const UNKNOWN_DECODE_TOKEN_ID: u32 = 10_000;
 
 fn fake_chat_tokenizer() -> TestTokenizer {
     TestTokenizer::new()
         .with_bos_token("<bos>", FAKE_BOS_TOKEN_ID)
+        .with_pair_separator_token("<sep>", FAKE_SEP_TOKEN_ID)
         .with_regular_token("<image>", 999)
         .with_regular_token("<|image_pad|>", 151655)
         .with_regular_token("<think>", 0xF001)
@@ -7836,4 +7839,471 @@ async fn pooling_endpoints_forward_preprocessed_images_to_engine() {
         assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
         engine.finish().await;
     }
+}
+
+fn scoring_pair_index(request: &EngineCoreRequest, pooling_task: PoolingTask) -> usize {
+    let external = request.external_req_id.as_deref().expect("external request id");
+    let mut segments = external.rsplit('-');
+    if pooling_task != PoolingTask::Classify {
+        segments.next().expect("bi-encoder requests name their side");
+    }
+    segments
+        .next()
+        .and_then(|segment| segment.parse().ok())
+        .unwrap_or_else(|| panic!("no pair index in external request id {external:?}"))
+}
+
+/// Build a router whose mock engine serves one pooling task and scores the pair
+/// at each index with `scores[index]`, so the scoring routes can be driven end
+/// to end.
+async fn test_scoring_app(
+    engine_id: &'static str,
+    pooling_task: PoolingTask,
+    scores: Vec<f32>,
+) -> (axum::Router, MockEngineTask) {
+    test_scoring_app_with_queries(engine_id, pooling_task, scores, 1).await
+}
+
+async fn test_scoring_app_with_queries(
+    engine_id: &'static str,
+    pooling_task: PoolingTask,
+    scores: Vec<f32>,
+    n_queries: usize,
+) -> (axum::Router, MockEngineTask) {
+    test_pooling_app_with_options(engine_id, pooling_task, scores, n_queries, false).await
+}
+
+async fn test_pooling_app_with_options(
+    engine_id: &'static str,
+    pooling_task: PoolingTask,
+    scores: Vec<f32>,
+    n_queries: usize,
+    raw_pooling: bool,
+) -> (axum::Router, MockEngineTask) {
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
+        handshake_address.clone(),
+        engine_id.as_bytes().to_vec(),
+        move |dealer, push| {
+            boxed_test_future(async move {
+                // `get_supported_tasks` is discovered once and then cached.
+                let utility = recv_engine_message(dealer).await;
+                let utility: EngineCoreUtilityRequest =
+                    rmp_serde::from_slice(&utility[1]).expect("decode utility request");
+                assert_eq!(utility.method_name, "get_supported_tasks");
+                send_outputs(
+                    push,
+                    utility_outputs(
+                        utility.call_id.as_u64().expect("numeric call id"),
+                        utility_result_value(vec![task_wire_literal(pooling_task)]),
+                    ),
+                )
+                .await;
+
+                // Bi-encoders encode each original query once.
+                let request_count = if raw_pooling {
+                    scores.len()
+                } else {
+                    match pooling_task {
+                        PoolingTask::Classify => scores.len(),
+                        _ => scores.len() + n_queries,
+                    }
+                };
+                let mut query_count = 0;
+                for _ in 0..request_count {
+                    let add = recv_engine_message(dealer).await;
+                    let request: EngineCoreRequest =
+                        rmp_serde::from_slice(&add[1]).expect("decode request");
+                    let params = request.pooling_params.as_ref().expect("pooling params are set");
+                    assert_eq!(params.task, pooling_task);
+                    assert!(request.sampling_params.is_none());
+
+                    // Cross-encoders must receive the query/document boundary.
+                    if pooling_task == PoolingTask::Classify && !raw_pooling {
+                        assert!(params.extra_kwargs.is_some());
+                    }
+
+                    let index = scoring_pair_index(
+                        &request,
+                        if raw_pooling {
+                            PoolingTask::Classify
+                        } else {
+                            pooling_task
+                        },
+                    );
+                    // A bi-encoder needs a vector to take a cosine over; a
+                    // cross-encoder emits the scalar score directly.
+                    let output = if raw_pooling {
+                        vec![scores[index]; 8]
+                    } else {
+                        match pooling_task {
+                            PoolingTask::Classify => vec![scores[index]],
+                            _ if request
+                                .external_req_id
+                                .as_deref()
+                                .unwrap()
+                                .ends_with("-query") =>
+                            {
+                                query_count += 1;
+                                assert!(index < n_queries);
+                                vec![if index.is_multiple_of(2) { 1.0 } else { -1.0 }, 0.0]
+                            }
+                            _ => {
+                                let score = scores[index - n_queries];
+                                vec![score, (1.0 - score * score).sqrt()]
+                            }
+                        }
+                    };
+                    let shape = if raw_pooling && pooling_task == PoolingTask::TokenEmbed {
+                        vec![2, 4]
+                    } else {
+                        vec![output.len()]
+                    };
+                    send_outputs(
+                        push,
+                        RequestBatchOutputs {
+                            outputs: vec![EngineCoreOutput {
+                                request_id: request.request_id.clone(),
+                                pooling_output: Some(
+                                    WireTensor::from_f32(shape, output)
+                                        .expect("build pooling tensor"),
+                                ),
+                                finish_reason: Some(EngineCoreFinishReason::Stop),
+                                ..Default::default()
+                            }],
+                            finished_requests: Some([request.request_id].into_iter().collect()),
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .await;
+                }
+                if pooling_task == PoolingTask::Embed && !raw_pooling {
+                    assert_eq!(query_count, n_queries);
+                }
+            })
+        },
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(test_llm(client), Arc::new(FakeChatBackend::new()));
+
+    (
+        build_router(Arc::new(AppState::new(
+            vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
+            chat,
+        ))),
+        engine_task,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn score_fans_one_query_out_across_documents_on_both_routes() {
+    for uri in ["/score", "/v1/score"] {
+        let (mut app, engine_task) =
+            test_scoring_app("engine-score", PoolingTask::Classify, vec![0.25, 0.75]).await;
+
+        let (status, json) = post_json(
+            &mut app,
+            uri,
+            json!({
+                "model": "Qwen/Qwen1.5-0.5B-Chat",
+                "text_1": "query",
+                "text_2": ["first", "second"],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["model"], "Qwen/Qwen1.5-0.5B-Chat");
+        assert!(json["id"].as_str().expect("id").starts_with("score-"));
+        assert_eq!(
+            json["data"],
+            json!([
+                {"index": 0, "object": "score", "score": 0.25},
+                {"index": 1, "object": "score", "score": 0.75},
+            ]),
+            "{uri}"
+        );
+        // `<bos> query <sep> first <sep>` is 13 tokens and the `second` pair
+        // is one longer, so the pair prompts total 27 tokens.
+        assert_eq!(json["usage"]["prompt_tokens"], 27);
+        assert_eq!(json["usage"]["total_tokens"], 27);
+
+        engine_task.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn score_reuses_one_query_embedding_across_documents() {
+    let (mut app, engine_task) = test_scoring_app(
+        "engine-score-embed",
+        PoolingTask::Embed,
+        vec![1.0, 0.0, -1.0],
+    )
+    .await;
+
+    let (status, json) = post_json(
+        &mut app,
+        "/score",
+        json!({"queries": "query", "documents": ["a", "bb", "ccc"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"][0]["score"], 1.0);
+    assert_eq!(json["data"][1]["score"], 0.0);
+    assert_eq!(json["data"][2]["score"], -1.0);
+    // The six query tokens count toward each pair; documents have 2, 3, 4 tokens.
+    assert_eq!(json["usage"]["prompt_tokens"], 27);
+
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn score_pairs_multiple_query_embeddings_positionally() {
+    let (mut app, engine_task) = test_scoring_app_with_queries(
+        "engine-score-embed-pairs",
+        PoolingTask::Embed,
+        vec![1.0, 1.0],
+        2,
+    )
+    .await;
+    let (status, json) = post_json(
+        &mut app,
+        "/score",
+        json!({
+            "queries": ["q1", "q2"], "documents": ["d1", "d2"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["data"],
+        json!([
+            {"index": 0, "object": "score", "score": 1.0},
+            {"index": 1, "object": "score", "score": -1.0},
+        ])
+    );
+    assert_eq!(json["usage"]["prompt_tokens"], 12);
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn score_rejects_mismatched_input_lengths() {
+    let (mut app, engine_task) =
+        test_scoring_app("engine-score-invalid", PoolingTask::Classify, Vec::new()).await;
+
+    let (status, json) = post_json(
+        &mut app,
+        "/score",
+        json!({"text_1": ["a", "b"], "text_2": ["c", "d", "e"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("Input lengths must be either 1:1, 1:N or N:N")
+    );
+
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn score_rejects_an_unknown_model() {
+    let (mut app, engine_task) =
+        test_scoring_app("engine-score-model", PoolingTask::Classify, Vec::new()).await;
+
+    let (status, json) = post_json(
+        &mut app,
+        "/score",
+        json!({"model": "nope", "text_1": "a", "text_2": "b"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"]["code"], "model_not_found");
+
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cross_encoder_score_rejects_pre_tokenized_prompts() {
+    let (mut app, engine_task) =
+        test_scoring_app("engine-score-tokens", PoolingTask::Classify, Vec::new()).await;
+
+    let (status, json) =
+        post_json(&mut app, "/score", json!({"text_1": [1, 2], "text_2": "b"})).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("must be text rather than token IDs")
+    );
+
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn rerank_ranks_documents_by_relevance_on_every_route() {
+    for uri in ["/rerank", "/v1/rerank", "/v2/rerank"] {
+        let (mut app, engine_task) =
+            test_scoring_app("engine-rerank", PoolingTask::Classify, vec![0.1, 0.9, 0.5]).await;
+
+        let (status, json) = post_json(
+            &mut app,
+            uri,
+            json!({
+                "model": "Qwen/Qwen1.5-0.5B-Chat",
+                "query": "query",
+                "documents": ["worst", "best", "middle"],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+        assert_eq!(json["model"], "Qwen/Qwen1.5-0.5B-Chat", "{uri}");
+        assert!(
+            json["id"].as_str().expect("id").starts_with("score-"),
+            "{uri}"
+        );
+        // Ranked best first, while `index` still points at the request order.
+        assert_eq!(
+            json["results"],
+            json!([
+                {"index": 1, "document": {"text": "best", "multi_modal": null},
+                 "relevance_score": 0.9},
+                {"index": 2, "document": {"text": "middle", "multi_modal": null},
+                 "relevance_score": 0.5},
+                {"index": 0, "document": {"text": "worst", "multi_modal": null},
+                 "relevance_score": 0.1},
+            ]),
+            "{uri}"
+        );
+        // Rerank reports only prompt tokens, with no completion breakdown.
+        // Each pair is `<bos> query <sep> document <sep>`, so 13 + 12 + 14.
+        assert_eq!(
+            json["usage"],
+            json!({"prompt_tokens": 39, "total_tokens": 39}),
+            "{uri}"
+        );
+        assert!(json["object"].is_null(), "{uri}");
+
+        engine_task.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn rerank_top_n_returns_only_the_best_documents() {
+    let (mut app, engine_task) = test_scoring_app(
+        "engine-rerank-top-n",
+        PoolingTask::Classify,
+        vec![0.1, 0.9, 0.5],
+    )
+    .await;
+
+    let (status, json) = post_json(
+        &mut app,
+        "/rerank",
+        json!({"query": "query", "documents": ["worst", "best", "middle"], "top_n": 2}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|result| result["index"].as_u64().expect("index"))
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    // Usage still covers every document that was scored, not just the top 2.
+    assert_eq!(json["usage"]["prompt_tokens"], 39);
+
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn rerank_accepts_a_single_document() {
+    let (mut app, engine_task) =
+        test_scoring_app("engine-rerank-single", PoolingTask::Classify, vec![0.5]).await;
+
+    let (status, json) = post_json(
+        &mut app,
+        "/rerank",
+        json!({"query": "query", "documents": "only"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["results"].as_array().expect("results").len(), 1);
+    assert_eq!(json["results"][0]["document"]["text"], "only");
+
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn rerank_rejects_a_query_list() {
+    let (mut app, engine_task) =
+        test_scoring_app("engine-rerank-invalid", PoolingTask::Classify, Vec::new()).await;
+
+    let (status, json) = post_json(
+        &mut app,
+        "/rerank",
+        json!({"query": ["a", "b"], "documents": ["c"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn rerank_rejects_an_unknown_model() {
+    let (mut app, engine_task) =
+        test_scoring_app("engine-rerank-model", PoolingTask::Classify, Vec::new()).await;
+
+    let (status, json) = post_json(
+        &mut app,
+        "/rerank",
+        json!({"model": "nope", "query": "a", "documents": ["b"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert_eq!(json["error"]["code"], "model_not_found");
+
+    engine_task.abort_and_join().await;
 }

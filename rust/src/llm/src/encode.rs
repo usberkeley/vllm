@@ -38,16 +38,25 @@ pub struct PoolingParams {
     /// such as the token IDs of `good_token` and `bad_token` in the
     /// `math-shepherd-mistral-7b-prm` model.
     pub returned_token_ids: Option<Vec<u32>>,
+    /// Index of the first prompt token belonging to the second sequence of a
+    /// text pair, as cross-encoder models need to separate query from
+    /// document. Prompts that are not pairs leave this unset.
+    pub compressed_token_type_ids: Option<usize>,
 }
 
 impl PoolingParams {
     fn into_engine(self, task: PoolingTask) -> EngineCorePoolingParams {
-        EngineCorePoolingParams {
+        let params = EngineCorePoolingParams {
             use_activation: self.use_activation,
             dimensions: self.dimensions,
             step_tag_id: self.step_tag_id,
             returned_token_ids: self.returned_token_ids,
             task,
+            ..Default::default()
+        };
+        match self.compressed_token_type_ids {
+            Some(boundary) => params.with_compressed_token_type_ids(boundary),
+            None => params,
         }
     }
 }
@@ -274,6 +283,7 @@ mod tests {
                 dimensions: Some(128),
                 step_tag_id: None,
                 returned_token_ids: None,
+                compressed_token_type_ids: None,
             },
             arrival_time: Some(42.5),
             cache_salt: Some("salt".to_string()),
@@ -304,6 +314,7 @@ mod tests {
                 step_tag_id: None,
                 returned_token_ids: None,
                 task: PoolingTask::Embed,
+                ..Default::default()
             })
         );
         assert_eq!(request.arrival_time, 42.5);

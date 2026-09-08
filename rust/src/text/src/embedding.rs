@@ -171,6 +171,7 @@ impl TextRequestProcessor {
                 dimensions: request.params.dimensions,
                 step_tag_id: None,
                 returned_token_ids: None,
+                compressed_token_type_ids: None,
             },
             arrival_time: request.arrival_time,
             cache_salt: request.cache_salt,
@@ -278,6 +279,7 @@ mod tests {
                     dimensions: None,
                     step_tag_id: None,
                     returned_token_ids: None,
+                    compressed_token_type_ids: None,
                 },
                 arrival_time: Some(
                     42.5,

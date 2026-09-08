@@ -146,3 +146,81 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     "stream": true
   }'
 ```
+
+### Pooling APIs
+
+The Rust frontend exposes the following pooling routes on top of
+`TextLlm::encode_batch` and `Llm::encode`:
+
+| Route | Result |
+| --- | --- |
+| `/pooling` | Sequence or token pooling tensors, preserving their dimensions |
+| `/classify` | Class probabilities, number of classes and optional model label |
+
+Pooling and classification accept a text string, a batch of strings,
+token IDs or a batch of token IDs in `input`. They support prompt truncation,
+LoRA model selection, priority and cache salt. Embedding dimensions and pooler
+activation defaults are resolved by engine-core. `/pooling` accepts `embed`,
+`classify`, `token_embed` and `token_classify`; when omitted, the first supported
+task in that order is selected.
+
+```bash
+curl http://127.0.0.1:8000/pooling \
+  -H "Content-Type: application/json" \
+  -d '{"input": "hello", "task": "embed"}'
+
+curl http://127.0.0.1:8000/classify \
+  -H "Content-Type: application/json" \
+  -d '{"input": "a useful result"}'
+```
+
+The configured model must support the requested task.
+
+This is endpoint coverage for text pooling, not full Python feature parity.
+Multimodal pooling inputs, batched chat conversations, IOProcessor plugins, composite outputs,
+padding, non-float32 output dtypes and binary HTTP responses are not supported.
+Unsupported request options return an error rather than being silently ignored.
+
+### Scoring
+
+Pooling models are served at `/score` (and `/v1/score` for compatibility).
+One query is scored against every document, and a query list of the same
+length is paired positionally instead.
+
+```bash
+curl http://127.0.0.1:8000/score \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "BAAI/bge-reranker-base",
+    "text_1": "What is the capital of France?",
+    "text_2": ["Paris is the capital of France.", "Berlin is in Germany."]
+  }'
+```
+
+`/rerank` ranks the documents instead of returning them in request order, and
+answers with the JinaAI rerank shape: each result keeps the `index` it had in
+the request, echoes its `document`, and carries a `relevance_score`. Use
+`top_n` to keep only the highest-scoring documents; token usage still covers
+every document that was scored. `/v1/rerank` and `/v2/rerank` are aliases.
+
+```bash
+curl http://127.0.0.1:8000/rerank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "BAAI/bge-reranker-base",
+    "query": "What is the capital of France?",
+    "documents": ["Berlin is in Germany.", "Paris is the capital of France."],
+    "top_n": 1
+  }'
+```
+
+How a pair becomes a score depends on what the model's pooler supports.
+Cross-encoders (`classify`) read the pair as one prompt joined by the
+tokenizer's pair template and return the classifier output. Embedding models
+(`embed`) encode each side separately and the frontend takes the cosine
+similarity; only that path accepts pre-tokenized inputs, since a cross-encoder
+needs the text to apply its pair template. Late-interaction scoring is not
+supported yet.
+
+For bi-encoder 1:N scoring, the query is encoded once and its embedding is
+reused across documents. Usage still counts the query tokens for every pair.

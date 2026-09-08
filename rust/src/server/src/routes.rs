@@ -15,6 +15,7 @@ mod pooling;
 mod pooling_input;
 mod profile;
 pub(super) mod render;
+mod scoring;
 mod server_info;
 mod sleep;
 mod tokenize;
@@ -120,7 +121,12 @@ fn build_router_with_options(
         .route("/classify", post(pooling::classify))
         // vLLM specific endpoints
         .route("/tokenize", post(tokenize::tokenize))
-        .route("/detokenize", post(tokenize::detokenize));
+        .route("/detokenize", post(tokenize::detokenize))
+        .route("/score", post(scoring::score))
+        .route("/v1/score", post(scoring::score))
+        .route("/rerank", post(scoring::rerank))
+        .route("/v1/rerank", post(scoring::rerank))
+        .route("/v2/rerank", post(scoring::rerank));
 
     if scale_out_endpoints_enabled {
         router = router.route("/inference/v1/generate", post(inference::generate));

@@ -26,6 +26,7 @@ pub use output::{
     TextOutputStreamExt, TokenAnchor, TokenAttribution,
 };
 pub use request::{Prompt, SamplingParams, TextRequest, normalize_top_k};
+pub use score::{ScoreError, ScoreMode, ScoreOutput, ScoreParams, ScoreRequest};
 use trait_set::trait_set;
 use vllm_engine_core_client::EngineCoreClient;
 pub use vllm_llm::FinishReason;
@@ -39,6 +40,7 @@ mod error;
 mod lower;
 pub mod output;
 mod request;
+mod score;
 mod truncation;
 pub use truncation::{PromptTruncation, PromptTruncationLimit, TruncationSide};
 pub use vllm_tokenizer as tokenizer;

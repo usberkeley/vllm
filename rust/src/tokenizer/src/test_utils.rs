@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{Result, Tokenizer, TokenizerError};
+use crate::{PairEncoding, Result, Tokenizer, TokenizerError};
 
 const FIRST_CONFIGURED_TOKEN_ID: u32 = 256;
 
@@ -73,6 +73,7 @@ pub struct TestTokenizer {
     unknown_decode: UnknownDecode,
     vocab_size: Option<usize>,
     bos_token_id: Option<u32>,
+    pair_separator_token_id: Option<u32>,
 }
 
 impl Default for TestTokenizer {
@@ -91,6 +92,7 @@ impl TestTokenizer {
             unknown_decode: UnknownDecode::Error,
             vocab_size: None,
             bos_token_id: None,
+            pair_separator_token_id: None,
         }
     }
 
@@ -121,6 +123,18 @@ impl TestTokenizer {
     pub fn with_bos_token(mut self, token: impl Into<String>, id: u32) -> Self {
         self.insert_token(token, id, TestTokenKind::Special);
         self.bos_token_id = Some(id);
+        self
+    }
+
+    /// Add a special separator token that enables [`Tokenizer::encode_pair`].
+    ///
+    /// Pairs are then encoded with the BERT template
+    /// `<bos> text <sep> text_pair <sep>`, so the second sequence starts right
+    /// after the first separator. Single-sequence [`Tokenizer::encode`] is
+    /// unaffected.
+    pub fn with_pair_separator_token(mut self, token: impl Into<String>, id: u32) -> Self {
+        self.insert_token(token, id, TestTokenKind::Special);
+        self.pair_separator_token_id = Some(id);
         self
     }
 
@@ -220,6 +234,34 @@ impl Tokenizer for TestTokenizer {
         }
 
         Ok(ids)
+    }
+
+    fn encode_pair(
+        &self,
+        text: &str,
+        text_pair: &str,
+        add_special_tokens: bool,
+    ) -> Result<PairEncoding> {
+        let Some(separator_id) = self.pair_separator_token_id else {
+            return Err(TokenizerError(
+                "test tokenizer was built without a pair separator token".to_string(),
+            ));
+        };
+
+        let mut token_ids = self.encode(text, add_special_tokens)?;
+        if add_special_tokens {
+            token_ids.push(separator_id);
+        }
+        let token_type_boundary = token_ids.len();
+        token_ids.extend(self.encode(text_pair, false)?);
+        if add_special_tokens {
+            token_ids.push(separator_id);
+        }
+
+        Ok(PairEncoding {
+            token_ids,
+            token_type_boundary,
+        })
     }
 
     fn encode_ordinary(&self, text: &str) -> Result<Vec<u32>> {
@@ -471,6 +513,32 @@ mod tests {
             "\u{FFFD}"
         );
         assert_eq!(strict.id_to_token(300), None);
+    }
+
+    #[test]
+    fn pair_encoding_marks_where_the_second_sequence_starts() {
+        let tokenizer = TestTokenizer::new()
+            .with_bos_token("<cls>", 256)
+            .with_pair_separator_token("<sep>", 257);
+
+        let encoded = tokenizer.encode_pair("a", "bc", true).unwrap();
+        assert_eq!(
+            encoded.token_ids,
+            vec![256, b'a' as u32, 257, b'b' as u32, b'c' as u32, 257]
+        );
+        assert_eq!(encoded.token_type_boundary, 3);
+
+        let without_specials = tokenizer.encode_pair("a", "bc", false).unwrap();
+        assert_eq!(
+            without_specials.token_ids,
+            vec![b'a' as u32, b'b' as u32, b'c' as u32]
+        );
+        assert_eq!(without_specials.token_type_boundary, 1);
+    }
+
+    #[test]
+    fn pair_encoding_is_unsupported_without_a_separator_token() {
+        assert!(TestTokenizer::new().encode_pair("a", "b", true).is_err());
     }
 
     #[test]

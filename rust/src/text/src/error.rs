@@ -9,6 +9,7 @@ use crate::embedding::EmbeddingError;
 pub use crate::lower::logprobs::LogprobsError;
 pub use crate::lower::sampling::SamplingParamsError;
 pub use crate::lower::token_ids::TokenIdsError;
+use crate::score::ScoreError;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -31,6 +32,8 @@ pub enum Error {
     SamplingParams(#[from] SamplingParamsError),
     #[error(transparent)]
     Embedding(#[from] EmbeddingError),
+    #[error(transparent)]
+    Score(#[from] ScoreError),
     #[error(
         "`min_tokens` must be less than or equal to `max_tokens`, \
          got min_tokens={min_tokens}, max_tokens={max_tokens}"
@@ -63,6 +66,7 @@ impl Error {
     pub fn is_request_validation_error(&self) -> bool {
         match self {
             Self::Embedding(error) => error.is_request_validation_error(),
+            Self::Score(error) => error.is_request_validation_error(),
             Self::PromptTooLong { .. }
             | Self::EmptyPromptTokenIds { .. }
             | Self::EmptyStopString { .. }

@@ -29,6 +29,23 @@ pub trait Tokenizer: Send + Sync {
     /// special, and control-token matcher is bypassed.
     fn encode_ordinary(&self, text: &str) -> Result<Vec<u32>>;
 
+    /// Encode a text pair the way cross-encoder scoring models expect, joining
+    /// both sequences with the tokenizer's own pair template.
+    ///
+    /// Backends without a pair template report an error; callers should treat
+    /// that as "this model cannot be served by the cross-encoder score path".
+    fn encode_pair(
+        &self,
+        text: &str,
+        text_pair: &str,
+        add_special_tokens: bool,
+    ) -> Result<PairEncoding> {
+        let _ = (text, text_pair, add_special_tokens);
+        Err(tokenizer_error!(
+            "this tokenizer backend does not support text-pair encoding"
+        ))
+    }
+
     /// Decode one token sequence into text.
     fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String>;
 
@@ -80,3 +97,47 @@ pub trait Tokenizer: Send + Sync {
 }
 
 pub type DynTokenizer = Arc<dyn Tokenizer>;
+
+/// Token IDs of one encoded text pair, as cross-encoder models consume them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairEncoding {
+    /// Token IDs of the joined pair, including the special tokens inserted by
+    /// the tokenizer's own pair template.
+    pub token_ids: Vec<u32>,
+    /// Index of the first token that belongs to the second sequence.
+    ///
+    /// Token type IDs of a pair are a run of zeros followed by a run of ones,
+    /// so this single boundary carries the same information. It equals
+    /// `token_ids.len()` when the tokenizer emits no token type IDs.
+    ///
+    /// Original Python compression:
+    /// <https://github.com/vllm-project/vllm/blob/6ec92bcbc8/vllm/entrypoints/pooling/scoring/utils.py#L253-L269>
+    pub token_type_boundary: usize,
+}
+
+impl PairEncoding {
+    /// Build a pair encoding from parallel token IDs and token type IDs.
+    ///
+    /// Token type IDs must be a run of zeros followed by a run of ones, which
+    /// is what every pair post-processor produces.
+    pub fn from_token_type_ids(token_ids: Vec<u32>, token_type_ids: &[u32]) -> Result<Self> {
+        if token_type_ids.len() != token_ids.len() {
+            return Err(tokenizer_error!(
+                "token type ids length {} does not match token ids length {}",
+                token_type_ids.len(),
+                token_ids.len()
+            ));
+        }
+        let boundary = token_type_ids.partition_point(|&type_id| type_id == 0);
+        if token_type_ids[boundary..].iter().any(|&type_id| type_id != 1) {
+            return Err(tokenizer_error!(
+                "token type ids are expected to be a sequence of zeros followed by a \
+                 sequence of ones"
+            ));
+        }
+        Ok(Self {
+            token_ids,
+            token_type_boundary: boundary,
+        })
+    }
+}

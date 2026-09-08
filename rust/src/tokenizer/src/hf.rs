@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 use std::borrow::Cow;
-use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use fastokens::Tokenizer as FastokensTokenizer;
 use fastokens::decoders::Decoder as FastokensDecoder;
@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 use crate::byte_level_decode::decode_byte_level;
 use crate::hf::added_tokens::load_tokenizer_json_with_extra_tokens;
-use crate::{Result, Tokenizer};
+use crate::{PairEncoding, Result, Tokenizer};
 
 mod added_tokens;
 
@@ -151,6 +151,28 @@ pub struct HuggingFaceTokenizer {
     special_token_ids: Arc<[u32]>,
     added_vocab: Box<[(String, u32)]>,
     vocab_size: usize,
+    /// Source `tokenizer.json` path, kept so text-pair encoding can fall back
+    /// to the HuggingFace backend: `fastokens` parses the pair template but
+    /// only ever applies the single-sequence one.
+    source_path: Option<PathBuf>,
+    /// HuggingFace tokenizer loaded on the first text-pair encode when the
+    /// primary backend is `fastokens`. `None` records a failed load so the
+    /// fallback is attempted only once.
+    pair_backend: OnceLock<Option<Box<HfTokenizer>>>,
+}
+
+/// Encode a text pair with the HuggingFace backend, the only one that applies
+/// the tokenizer's pair template and reports token type IDs.
+fn encode_hf_pair(
+    tokenizer: &HfTokenizer,
+    text: &str,
+    text_pair: &str,
+    add_special_tokens: bool,
+) -> Result<PairEncoding> {
+    let encoding = tokenizer
+        .encode((text, text_pair), add_special_tokens)
+        .map_err(|error| tokenizer_error!("pair encoding failed: {}", error.as_report()))?;
+    PairEncoding::from_token_type_ids(encoding.get_ids().to_vec(), encoding.get_type_ids())
 }
 
 impl HuggingFaceTokenizer {
@@ -182,6 +204,8 @@ impl HuggingFaceTokenizer {
             special_token_ids,
             added_vocab,
             vocab_size,
+            source_path: None,
+            pair_backend: OnceLock::new(),
         }
     }
 
@@ -220,6 +244,8 @@ impl HuggingFaceTokenizer {
             special_token_ids,
             added_vocab,
             vocab_size,
+            source_path: None,
+            pair_backend: OnceLock::new(),
         }
     }
 
@@ -229,7 +255,10 @@ impl HuggingFaceTokenizer {
         let tokenizer_json = load_tokenizer_json_with_extra_tokens(path)?;
         let t = FastokensTokenizer::from_json(tokenizer_json)
             .map_err(|error| tokenizer_error!("failed to load tokenizer: {}", error.as_report()))?;
-        Ok(Self::from_fastokens_backend(t))
+        Ok(Self {
+            source_path: Some(path.to_path_buf()),
+            ..Self::from_fastokens_backend(t)
+        })
     }
 
     /// Load from `tokenizer.json` with Hugging Face `tokenizers`.
@@ -255,6 +284,43 @@ impl HuggingFaceTokenizer {
             }
         }
     }
+
+    /// Return a HuggingFace tokenizer able to apply the pair template, loading
+    /// it from the original `tokenizer.json` on first use when the primary
+    /// backend is `fastokens`.
+    fn pair_backend(&self) -> Result<&HfTokenizer> {
+        if let Backend::Hf(tokenizer) = &self.backend {
+            return Ok(tokenizer);
+        }
+
+        let Some(path) = self.source_path.as_deref() else {
+            return Err(tokenizer_error!(
+                "text-pair encoding requires the source tokenizer.json, which was not recorded"
+            ));
+        };
+        self.pair_backend
+            .get_or_init(|| {
+                info!(
+                    path = %path.display(),
+                    "loading huggingface tokenizers backend for text-pair encoding"
+                );
+                Self::new_hf(path)
+                    .inspect_err(|error| {
+                        warn!(
+                            path = %path.display(),
+                            error = %error.as_report(),
+                            "failed to load a text-pair capable tokenizer backend"
+                        );
+                    })
+                    .ok()
+                    .and_then(|tokenizer| match tokenizer.backend {
+                        Backend::Hf(tokenizer) => Some(tokenizer),
+                        _ => None,
+                    })
+            })
+            .as_deref()
+            .ok_or_else(|| tokenizer_error!("this tokenizer does not support text-pair encoding"))
+    }
 }
 
 impl Tokenizer for HuggingFaceTokenizer {
@@ -270,6 +336,15 @@ impl Tokenizer for HuggingFaceTokenizer {
                 .encode_with_special_tokens(text, add_special_tokens)
                 .map_err(|error| tokenizer_error!("encoding failed: {}", error.as_report())),
         }
+    }
+
+    fn encode_pair(
+        &self,
+        text: &str,
+        text_pair: &str,
+        add_special_tokens: bool,
+    ) -> Result<PairEncoding> {
+        encode_hf_pair(self.pair_backend()?, text, text_pair, add_special_tokens)
     }
 
     fn encode_ordinary(&self, text: &str) -> Result<Vec<u32>> {

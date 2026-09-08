@@ -38,6 +38,8 @@ pub struct HfTextBackend {
     primary_eos_token_id: Option<u32>,
     /// Additional EOS ids that should flow through stop-token handling.
     extra_eos_token_ids: BTreeSet<u32>,
+    /// Padding token id declared by the tokenizer config, when any.
+    pad_token_id: Option<u32>,
     /// Generation-config for sampling defaults that may be inherited when the
     /// user does not explicitly override them.
     generation_config: GenerationConfig,
@@ -66,6 +68,11 @@ impl HfTextBackend {
             &generation_config,
             tokenizer.as_ref(),
         );
+        let pad_token_id = tokenizer_config
+            .special_tokens
+            .pad_token
+            .as_ref()
+            .and_then(|token| tokenizer.token_to_id(token.as_str()));
 
         info!(
             model_id,
@@ -78,6 +85,7 @@ impl HfTextBackend {
             tokenizer,
             primary_eos_token_id,
             extra_eos_token_ids,
+            pad_token_id,
             generation_config,
             generation_config_mode,
             model_vocab_size,
@@ -147,6 +155,10 @@ impl TextBackend for HfTextBackend {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn pad_token_id(&self) -> Option<u32> {
+        self.pad_token_id
     }
 
     fn sampling_hints(&self) -> Result<SamplingHints> {

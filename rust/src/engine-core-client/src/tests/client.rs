@@ -29,6 +29,7 @@ use crate::protocol::output::{
     DpControlMessage, DpControlOutput, EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs,
     RequestBatchOutputs, UtilityCallOutput, decode_engine_core_outputs,
 };
+use crate::protocol::pooling::EngineCorePoolingParams;
 use crate::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
 use crate::protocol::sampling::EngineCoreSamplingParams;
 use crate::protocol::stats::{KvConnectorStats, MooncakeOperation, SchedulerStats};
@@ -2703,6 +2704,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     let multipart_pooling_frames =
         lines.next().expect("missing multipart pooling output fixture line");
     let ready_response_hex = lines.next().expect("missing ready response fixture line");
+    let pooling_params_hex = lines.next().expect("missing pooling params fixture line");
 
     let request_bytes = hex::decode(request_hex).unwrap();
     let multimodal_request_bytes = hex::decode(multimodal_request_hex).unwrap();
@@ -2895,6 +2897,31 @@ fn python_msgpack_fixtures_match_rust_encoding() {
         .expect("multipart pooling output decoded");
     assert_eq!(pooling_tensor.shape, vec![2]);
     assert_eq!(pooling_tensor.to_f32_vec().unwrap(), vec![0.25, -0.5]);
+
+    // Pooling params are the positional prefix of Python's array-like struct:
+    // every field Rust models must sit at the same index, or cross-encoder
+    // `extra_kwargs` would land on an unrelated field. Only the trailing
+    // `output_kind` is left for Python to default.
+    let python_pooling_params: Vec<Value> =
+        rmp_serde::from_slice(&hex::decode(pooling_params_hex).unwrap()).unwrap();
+    let rust_pooling_params: Vec<Value> = rmp_serde::from_slice(
+        &rmp_serde::to_vec(
+            &EngineCorePoolingParams {
+                use_activation: Some(false),
+                task: PoolingTask::Classify,
+                ..Default::default()
+            }
+            .with_compressed_token_type_ids(3),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        python_pooling_params[..rust_pooling_params.len()],
+        rust_pooling_params[..],
+        "EngineCorePoolingParams drifted from the Python msgspec field order",
+    );
+    assert_eq!(python_pooling_params.len(), rust_pooling_params.len() + 1);
 
     let map_keys = |bytes: &[u8]| -> BTreeSet<String> {
         match decode_value(bytes) {

@@ -136,6 +136,14 @@ pub trait TextBackend: Send + Sync {
     fn tokenizer_vocab_size(&self) -> usize {
         self.tokenizer().vocab_size()
     }
+
+    /// Return the tokenizer's padding token ID, when it declares one.
+    ///
+    /// Bi-encoder scoring uses it to join the query and document token IDs it
+    /// reports back, matching how Python accounts for pair prompt tokens.
+    fn pad_token_id(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Shared trait-object form of [`TextBackend`].
