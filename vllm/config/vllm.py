@@ -1373,7 +1373,9 @@ class VllmConfig:
                     "Auto-disabled DeepGemm for model_type=%s on Blackwell. "
                     "DeepGemm E8M0 scale format causes accuracy degradation "
                     "for this architecture. Falling back to CUTLASS. "
-                    "To disable DeepGemm globally, set VLLM_USE_DEEP_GEMM=0.",
+                    "To continue using DeepGemm with float32 scales, set "
+                    "VLLM_USE_DEEP_GEMM_E8M0=0. To disable DeepGemm globally, "
+                    "set VLLM_USE_DEEP_GEMM=0.",
                     model_type,
                 )
 

@@ -43,6 +43,8 @@ def should_auto_disable_deep_gemm(model_type: str | None) -> bool:
     """
     if model_type is None:
         return False
+    if not (envs.VLLM_USE_DEEP_GEMM and envs.VLLM_USE_DEEP_GEMM_E8M0):
+        return False
     if not (
         current_platform.is_device_capability_family(100)
         or current_platform.is_device_capability_family(120)
