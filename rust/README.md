@@ -43,6 +43,13 @@ For example:
 VLLM_USE_RUST_FRONTEND=1 vllm serve Qwen/Qwen3-0.6B
 ```
 
+For `/v1/chat/completions`, enable generated output logs with
+`--enable-log-requests --enable-log-outputs`. Streaming requests log both deltas
+and the complete generated message. Add `--no-enable-log-deltas` to log only the
+complete message. Output logs require an INFO or more verbose logging level;
+they include visible reasoning and tool calls, but omit reasoning when the
+request sets `include_reasoning=false`.
+
 ### RL weight synchronization
 
 With `VLLM_SERVER_DEV_MODE=1`, the Rust frontend supports the HTTP weight-transfer
