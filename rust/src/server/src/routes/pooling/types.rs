@@ -48,7 +48,7 @@ impl PoolingRequest {
         if self.dimensions == Some(0) {
             bail_invalid_request!(param = "dimensions", "dimensions must be positive");
         }
-        // TODO: support chat/multimodal inputs, padding and additional output dtypes.
+        // TODO: support batched conversations, padding and additional output dtypes.
         for (key, value) in &self.extra {
             let supported = match key.as_str() {
                 "user" => true,

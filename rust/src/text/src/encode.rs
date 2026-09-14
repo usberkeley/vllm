@@ -30,19 +30,27 @@ pub struct TextEncodeRequest {
 
 impl TextRequestProcessor {
     /// Tokenize and validate a pooling input without generation defaults.
-    pub fn prepare_encode(&self, request: TextEncodeRequest) -> Result<EncodeRequest> {
+    pub fn prepare_encode(&self, mut request: TextEncodeRequest) -> Result<EncodeRequest> {
         if request.mm_features.is_some() && !matches!(request.prompt, Prompt::TokenIds(_)) {
             return Err(crate::Error::MultimodalRequiresTokenIds);
         }
         if request.mm_features.is_some() && request.prompt_truncation.is_some() {
             return Err(crate::Error::TruncateUnsupportedWithMultimodal);
         }
-        let prompt_token_ids = self.prepare_prompt_tokens(
-            request.prompt,
-            request.add_special_tokens,
-            request.prompt_truncation,
-            None,
-        )?;
+        let mut prompt_token_ids =
+            self.prepare_prompt_tokens(request.prompt, request.add_special_tokens, None, None)?;
+        if let Some(truncation) = request.prompt_truncation {
+            let original_len = prompt_token_ids.len();
+            truncation.apply(&mut prompt_token_ids, self.max_model_len)?;
+            if let Some(boundary) = request.pooling_params.compressed_token_type_ids.as_mut() {
+                *boundary = crate::score::truncated_boundary(
+                    *boundary,
+                    original_len,
+                    prompt_token_ids.len(),
+                    truncation.side,
+                );
+            }
+        }
         self.validate_prompt_tokens(&request.request_id, &prompt_token_ids)?;
         Ok(EncodeRequest {
             request_id: request.request_id,

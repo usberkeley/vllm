@@ -410,7 +410,6 @@ mod tests {
         expect![[r#"
             EmbeddingOutput {
                 request_id: "external-id",
-                mm_features: None,
                 prompt_token_ids: [
                     1,
                     2,

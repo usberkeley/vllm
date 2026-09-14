@@ -225,6 +225,58 @@ impl ChatRenderer for HfChatRenderer {
     fn render(&self, request: &ChatRequest) -> Result<RenderedPrompt> {
         self.apply_chat_template(request)
     }
+
+    fn render_score(
+        &self,
+        query: &ChatContent,
+        document: &ChatContent,
+        options: &crate::ChatOptions,
+    ) -> Result<RenderedPrompt> {
+        for key in [
+            "messages",
+            "tools",
+            "documents",
+            "chat_template",
+            "tokenize",
+            "add_generation_prompt",
+            "continue_final_message",
+        ] {
+            if options.template_kwargs.contains_key(key) {
+                return Err(Error::ChatTemplate(format!(
+                    "scoring template argument `{key}` is reserved"
+                )));
+            }
+        }
+        let template = CompiledChatTemplate::new(
+            options.chat_template.clone().ok_or(Error::MissingChatTemplate)?,
+            self.content_format,
+        )
+        .map_err(|error| Error::ChatTemplate(error.to_report_string()))?;
+        let mut messages = to_template_messages(
+            &[
+                ChatMessage::user(query.clone()),
+                ChatMessage::user(document.clone()),
+            ],
+            template.content_format(),
+            self.multimodal.as_ref(),
+        )?;
+        messages[0].role = "query";
+        messages[1].role = "document";
+        let mut kwargs = self.default_template_kwargs.clone();
+        kwargs.extend(options.template_kwargs.clone());
+        let prompt = template
+            .apply(TemplateContext {
+                messages: &messages,
+                template_kwargs: Some(&kwargs),
+                special_tokens: self.special_tokens.as_ref(),
+                ..Default::default()
+            })
+            .map_err(|error| Error::ChatTemplate(error.to_report_string()))?;
+        Ok(RenderedPrompt {
+            prompt: Prompt::Text(prompt),
+            effective_template_kwargs: kwargs,
+        })
+    }
 }
 
 /// Chat message in the JSON shape expected by Jinja chat templates.
@@ -447,7 +499,7 @@ fn to_template_openai_content(
     }
 }
 
-fn to_template_string_content(
+pub(crate) fn to_template_string_content(
     content: &ChatContent,
     multimodal: Option<&MultimodalRenderInfo>,
 ) -> Result<String> {
@@ -640,6 +692,33 @@ mod tests {
         .prompt
         .into_text()
         .map_err(|_| unreachable!("HF renderer should return text prompt"))
+    }
+
+    #[test]
+    fn scoring_template_uses_query_document_roles_and_media_placeholders() {
+        let renderer = HfChatRenderer::new(
+            Some("unused chat template".into()),
+            HashMap::new(),
+            ChatTemplateContentFormatOption::String,
+        )
+        .unwrap()
+        .with_multimodal(Some(MultimodalRenderInfo {
+            image_token: Some("<image>".into()),
+            ..Default::default()
+        }));
+        let rendered = renderer.render_score(
+            &crate::ChatContent::Parts(vec![ChatContentPart::image_url("data:image/png;base64,unused")]),
+            &crate::ChatContent::Text("document".into()),
+            &crate::ChatOptions {
+                chat_template: Some("{{ instruction }}|{% for m in messages %}{{ m.role }}={{ m.content }};{% endfor %}".into()),
+                template_kwargs: HashMap::from([("instruction".into(), serde_json::json!("rank"))]),
+                ..Default::default()
+            },
+        ).unwrap();
+        assert_eq!(
+            rendered.prompt,
+            Prompt::Text("rank|query=<image>;document=document;".into())
+        );
     }
 
     fn render_mm(

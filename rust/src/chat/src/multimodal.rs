@@ -43,7 +43,7 @@ mod item;
 mod tensor;
 mod video;
 
-use self::expand::expand_prompt_token_ids;
+use self::expand::expand_prompt_token_ids_with_boundary;
 
 /// Resolved multimodal support for one loaded model.
 #[derive(Clone)]
@@ -581,7 +581,7 @@ pub(crate) async fn finalize_rendered_prompt(
 ///
 /// Assistant history is skipped because generated assistant blocks are already
 /// represented as text for prompt rendering in this crate.
-fn extract_media_parts(request: &ChatRequest) -> Result<Vec<MediaContentPart>> {
+pub(crate) fn extract_media_parts(request: &ChatRequest) -> Result<Vec<MediaContentPart>> {
     let mut all_parts = Vec::new();
     for message in &request.messages {
         let content = match message {
@@ -702,6 +702,17 @@ impl MultimodalModelInfo {
         prompt_token_ids: &mut Vec<u32>,
         model_dtype: ModelDtype,
     ) -> Result<MmFeatures> {
+        self.prepare_multimodal_with_boundary(media_parts, prompt_token_ids, model_dtype, &mut None)
+            .await
+    }
+
+    pub(crate) async fn prepare_multimodal_with_boundary(
+        &self,
+        media_parts: Vec<MediaContentPart>,
+        prompt_token_ids: &mut Vec<u32>,
+        model_dtype: ModelDtype,
+        boundary: &mut Option<usize>,
+    ) -> Result<MmFeatures> {
         let media_parts_len = media_parts.len();
         if media_parts_len == 0 {
             return Ok(Vec::new());
@@ -722,7 +733,8 @@ impl MultimodalModelInfo {
             prepared.push(self.prepare_audios(fetched.audios, fetched.audio_uuids).await?);
         }
 
-        let mut ranges = expand_prompt_token_ids(prompt_token_ids, &prepared)?;
+        let mut ranges =
+            expand_prompt_token_ids_with_boundary(prompt_token_ids, &prepared, boundary)?;
 
         let mut features = Vec::with_capacity(media_parts_len);
         for media in prepared {

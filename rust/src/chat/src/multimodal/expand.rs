@@ -47,9 +47,18 @@ impl<'a> ExpansionLane<'a> {
 ///
 /// The returned ranges point into the already-expanded prompt, grouped per
 /// modality in item order.
-pub(super) fn expand_prompt_token_ids(
+#[cfg(test)]
+fn expand_prompt_token_ids(
     prompt_token_ids: &mut Vec<u32>,
     prepared: &[PreparedMedia],
+) -> Result<HashMap<Modality, Vec<PlaceholderRange>>> {
+    expand_prompt_token_ids_with_boundary(prompt_token_ids, prepared, &mut None)
+}
+
+pub(super) fn expand_prompt_token_ids_with_boundary(
+    prompt_token_ids: &mut Vec<u32>,
+    prepared: &[PreparedMedia],
+    boundary: &mut Option<usize>,
 ) -> Result<HashMap<Modality, Vec<PlaceholderRange>>> {
     let mut lanes = prepared.iter().filter_map(ExpansionLane::from_prepared).collect::<Vec<_>>();
     if lanes.is_empty() {
@@ -67,7 +76,11 @@ pub(super) fn expand_prompt_token_ids(
     let mut expanded = Vec::with_capacity(expanded_len);
     let mut ranges = HashMap::<Modality, Vec<PlaceholderRange>>::new();
 
-    for &token in prompt_token_ids.iter() {
+    let original_boundary = *boundary;
+    for (index, &token) in prompt_token_ids.iter().enumerate() {
+        if original_boundary == Some(index) {
+            *boundary = Some(expanded.len());
+        }
         let lane = lanes
             .iter_mut()
             .find(|lane| lane.marker_token_id == token && !lane.replacements.is_empty());
@@ -125,6 +138,9 @@ pub(super) fn expand_prompt_token_ids(
         }
     }
 
+    if original_boundary == Some(prompt_token_ids.len()) {
+        *boundary = Some(expanded.len());
+    }
     *prompt_token_ids = expanded;
 
     Ok(ranges)
@@ -267,6 +283,16 @@ mod tests {
             &ranges[0],
             &[false, true, false, true, false, false, true, false],
         );
+    }
+
+    #[test]
+    fn pair_boundary_moves_past_all_query_replacement_tokens() {
+        let mut ids = vec![1, LLAMA4_IMAGE_ID, 2];
+        let prepared = vec![llama4_prepared(vec![llama4_multi_tile_replacement()])];
+        let mut boundary = Some(2);
+        expand_prompt_token_ids_with_boundary(&mut ids, &prepared, &mut boundary).unwrap();
+        assert_eq!(boundary, Some(ids.len() - 1));
+        assert_eq!(ids[boundary.unwrap()], 2);
     }
 
     #[test]

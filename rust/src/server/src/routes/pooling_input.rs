@@ -21,8 +21,8 @@ pub(crate) enum Input {
     Text(String),
     TextBatch(Vec<String>),
     Content { content: Vec<ContentPart> },
-    ContentBatch(Vec<ContentInput>),
     Messages(Vec<ChatMessage>),
+    ContentBatch(Vec<ContentInput>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,4 +131,23 @@ enum Either {
     Prompt(Prompt),
     Messages(Vec<ChatMessage>),
     Content(Vec<ContentPart>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_conversations_preserve_roles_instead_of_becoming_a_content_batch() {
+        let input: Input = serde_json::from_value(serde_json::json!([
+            {"role": "system", "content": [{"type": "text", "text": "embed"}]},
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "image.png"}}]}
+        ]))
+        .unwrap();
+        let Input::Messages(messages) = input else {
+            panic!("conversation was treated as separate pooling inputs");
+        };
+        assert!(matches!(messages[0], ChatMessage::System { .. }));
+        assert!(matches!(messages[1], ChatMessage::User { .. }));
+    }
 }

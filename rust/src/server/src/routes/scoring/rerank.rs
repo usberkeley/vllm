@@ -13,9 +13,8 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-use vllm_text::Prompt;
 
-use super::{ScoreInput, ScoredPairs, ScoringParams, prepare_pairs, run_pairs};
+use super::{ScoreInput, ScoredPairs, ScoringParams, run_pairs};
 use crate::routes::openai::utils::types::Normalizable;
 use crate::routes::openai::utils::validated_json::ValidatedJson;
 use crate::state::AppState;
@@ -33,7 +32,7 @@ pub(crate) struct RerankRequest {
     #[serde(flatten)]
     pub common: ScoringParams,
     /// The single query every document is scored against.
-    pub query: Prompt,
+    pub query: super::ScoreItem,
     /// The documents to rank.
     pub documents: ScoreInput,
     /// How many of the highest-scoring documents to return. `0` returns all.
@@ -46,13 +45,11 @@ impl Normalizable for RerankRequest {}
 /// The document a result refers to, echoed back to the caller.
 ///
 /// `text` is absent for pre-tokenized documents, which have no text to return.
-/// `multi_modal` exists for wire compatibility; this frontend does not accept
-/// multimodal score inputs yet.
-// TODO: populate `multi_modal` once multimodal score inputs are supported.
+/// Structured content is echoed in `multi_modal`.
 #[derive(Debug, Clone, Serialize)]
 struct RerankDocument {
     text: Option<String>,
-    multi_modal: Option<()>,
+    multi_modal: Option<Vec<crate::routes::openai::utils::types::ContentPart>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,16 +86,19 @@ pub async fn rerank(
     let lora_resolution = state.resolve_model_with_loras(requested_model).await;
     let ctx = resolve_request_context(&headers, body.common.request_id.as_deref());
 
-    let documents = body.documents.into_prompts();
-    let echoed_documents = documents.iter().map(document_text).collect::<Vec<_>>();
+    let documents = body.documents.into_items();
+    let echoed_documents = documents.iter().map(document_echo).collect::<Vec<_>>();
     let top_n = body.top_n;
-    let prepared = match prepare_pairs(
+    let prepared = match super::multimodal::prepare(
         body.common,
         vec![body.query],
         documents,
         &lora_resolution,
         ctx,
-    ) {
+        &state.chat,
+    )
+    .await
+    {
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
     };
@@ -109,11 +109,20 @@ pub async fn rerank(
     }
 }
 
-/// Return the text to echo for one document, if it had any.
-fn document_text(document: &Prompt) -> Option<String> {
+fn document_echo(document: &super::ScoreItem) -> RerankDocument {
     match document {
-        Prompt::Text(text) => Some(text.clone()),
-        Prompt::TokenIds(_) => None,
+        super::ScoreItem::Text(text) => RerankDocument {
+            text: Some(text.clone()),
+            multi_modal: None,
+        },
+        super::ScoreItem::TokenIds(_) => RerankDocument {
+            text: None,
+            multi_modal: None,
+        },
+        super::ScoreItem::Content { content } => RerankDocument {
+            text: None,
+            multi_modal: Some(content.clone()),
+        },
     }
 }
 
@@ -124,7 +133,7 @@ fn document_text(document: &Prompt) -> Option<String> {
 /// <https://github.com/vllm-project/vllm/blob/6ec92bcbc8/vllm/entrypoints/pooling/scoring/serving.py#L138-L185>
 fn build_response(
     scored: ScoredPairs,
-    documents: &[Option<String>],
+    documents: &[RerankDocument],
     top_n: usize,
 ) -> RerankResponse {
     let usage = RerankUsage {
@@ -136,10 +145,7 @@ fn build_response(
         .iter()
         .map(|pair| RerankResult {
             index: pair.index,
-            document: RerankDocument {
-                text: documents.get(pair.index).cloned().flatten(),
-                multi_modal: None,
-            },
+            document: documents[pair.index].clone(),
             relevance_score: pair.score,
         })
         .collect::<Vec<_>>();
@@ -185,8 +191,11 @@ mod tests {
         }
     }
 
-    fn documents(texts: &[&str]) -> Vec<Option<String>> {
-        texts.iter().map(|text| Some(text.to_string())).collect()
+    fn documents(texts: &[&str]) -> Vec<RerankDocument> {
+        texts
+            .iter()
+            .map(|text| document_echo(&super::super::ScoreItem::Text(text.to_string())))
+            .collect()
     }
 
     #[test]
@@ -241,7 +250,11 @@ mod tests {
 
     #[test]
     fn pre_tokenized_documents_echo_no_text() {
-        let response = build_response(scored(&[0.5]), &[None], 0);
+        let response = build_response(
+            scored(&[0.5]),
+            &[document_echo(&super::super::ScoreItem::TokenIds(vec![1]))],
+            0,
+        );
 
         assert!(response.results[0].document.text.is_none());
         let json = serde_json::to_value(&response).unwrap();
@@ -258,8 +271,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(request.query, Prompt::Text("q".to_string()));
-        assert_eq!(request.documents.clone().into_prompts().len(), 2);
+        assert_eq!(
+            request.query,
+            super::super::ScoreItem::Text("q".to_string())
+        );
+        assert_eq!(request.documents.clone().into_items().len(), 2);
         assert_eq!(request.top_n, 1);
     }
 

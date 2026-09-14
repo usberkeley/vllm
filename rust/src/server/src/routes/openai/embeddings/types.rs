@@ -27,12 +27,12 @@ pub(crate) enum Endianness {
 
 /// OpenAI-compatible embeddings request.
 ///
-/// Mirrors the completion-input variant of Python vLLM's `EmbeddingRequest`.
+/// Accepts completion inputs and a single chat conversation.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub(crate) struct EmbeddingRequest {
     /// ID of the model to use. An omitted or empty value selects the default.
     pub model: Option<String>,
-    /// One text/token-ID prompt or a batch of homogeneous prompts.
+    /// Text, token IDs, structured content, or a chat conversation.
     pub input: Option<Input>,
     #[serde(flatten)]
     pub chat: ChatInputOptions,

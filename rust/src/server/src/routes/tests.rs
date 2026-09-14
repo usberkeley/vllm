@@ -787,6 +787,8 @@ async fn test_pooling_app_with_backend(
                                 .external_req_id
                                 .as_deref()
                                 .expect("external request id")
+                                .trim_end_matches("-query")
+                                .trim_end_matches("-document")
                                 .rsplit('-')
                                 .next()
                                 .expect("batch index")
@@ -8306,4 +8308,127 @@ async fn rerank_rejects_an_unknown_model() {
     assert_eq!(json["error"]["code"], "model_not_found");
 
     engine_task.abort_and_join().await;
+}
+
+fn scoring_image() -> serde_json::Value {
+    json!({"content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}]})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn multimodal_bi_encoder_reuses_query_and_preserves_mixed_document_order() {
+    let (mut app, engine) = test_pooling_app_with_backend(
+        "score-images-embed",
+        vec![PoolingTask::Embed],
+        vec![vec![1., 0.], vec![1., 0.], vec![0., 1.]]
+            .into_iter()
+            .map(|data| WireTensor::from_f32(vec![2], data).unwrap())
+            .collect(),
+        PoolingOutputOrder::Immediate,
+        |request| {
+            let id = request.external_req_id.as_deref().unwrap();
+            let expects_media = !id.ends_with("2-document");
+            assert_eq!(request.mm_features.is_some(), expects_media);
+            assert!(request.pooling_params.as_ref().unwrap().extra_kwargs.is_none());
+        },
+        Arc::new(FakeChatBackend::with_multimodal_model_info(
+            qwen_multimodal_model_info(),
+        )),
+    )
+    .await;
+    let (status, body) = post_pooling_json(
+        &mut app,
+        "/score",
+        json!({
+            "data_1": scoring_image(), "data_2": [scoring_image(), "text document"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"][0]["score"], 1.0);
+    assert_eq!(body["data"][1]["score"], 0.0);
+    engine.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn multimodal_cross_encoder_expands_both_sides_and_rerank_echoes_content() {
+    for uri in ["/score", "/v1/score", "/rerank", "/v1/rerank", "/v2/rerank"] {
+        let (mut app, engine) = test_pooling_app_with_backend(
+            "score-images-classify",
+            vec![PoolingTask::Classify],
+            vec![0.25, 0.75]
+                .into_iter()
+                .map(|score| WireTensor::from_f32(vec![1], vec![score]).unwrap())
+                .collect(),
+            PoolingOutputOrder::Immediate,
+            |request| {
+                let features = request.mm_features.as_ref().unwrap();
+                assert_eq!(features.len(), 2);
+                let query = &features[0].mm_position;
+                let document = &features[1].mm_position;
+                let boundary = request
+                    .pooling_params
+                    .as_ref()
+                    .unwrap()
+                    .extra_kwargs
+                    .as_ref()
+                    .unwrap()["compressed_token_type_ids"]
+                    .as_u64()
+                    .unwrap() as usize;
+                assert_eq!(boundary, query.offset + query.length + 1);
+                assert_eq!(boundary, document.offset);
+                let ids = request.prompt_token_ids.as_ref().unwrap();
+                assert_eq!(ids[boundary - 1], FAKE_SEP_TOKEN_ID);
+                assert_eq!(ids[boundary], 151655);
+            },
+            Arc::new(FakeChatBackend::with_multimodal_model_info(
+                qwen_multimodal_model_info(),
+            )),
+        )
+        .await;
+        let body = if uri.ends_with("rerank") {
+            json!({"query": scoring_image(), "documents": [scoring_image(), scoring_image()], "top_n": 1})
+        } else {
+            json!({"queries": scoring_image(), "documents": [scoring_image(), scoring_image()]})
+        };
+        let (status, body) = post_pooling_json(&mut app, uri, body).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        if uri.ends_with("rerank") {
+            assert_eq!(body["results"].as_array().unwrap().len(), 1);
+            assert_eq!(body["results"][0]["index"], 1);
+            assert_eq!(
+                body["results"][0]["document"]["multi_modal"],
+                scoring_image()["content"]
+            );
+        } else {
+            assert_eq!(body["data"][1]["score"], 0.75);
+        }
+        engine.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pooling_and_scoring_reject_media_truncation_before_fetching() {
+    let mut app = test_app().await;
+    for uri in ["/v1/embeddings", "/pooling", "/score", "/rerank"] {
+        let image =
+            json!({"content": [{"type": "image_url", "image_url": {"url": "invalid-media-url"}}]});
+        let mut body = match uri {
+            "/score" => json!({"data_1": "q", "data_2": image}),
+            "/rerank" => json!({"query": "q", "documents": image}),
+            _ => json!({"input": image}),
+        };
+        body["truncate_prompt_tokens"] = json!(1);
+        let (status, body) = post_pooling_json(&mut app, uri, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("truncate_prompt_tokens is not supported"),
+            "{body}"
+        );
+    }
 }

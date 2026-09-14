@@ -176,8 +176,30 @@ curl http://127.0.0.1:8000/classify \
 
 The configured model must support the requested task.
 
-This is endpoint coverage for text pooling, not full Python feature parity.
-Multimodal pooling inputs, batched chat conversations, IOProcessor plugins, composite outputs,
+For multimodal pooling, `/v1/embeddings`, `/pooling` and `/classify` accept a
+conversation in `messages` (or a conversation in `input`). The model's chat
+renderer and media processor prepare the expanded tokens and features together.
+`chat_template`, `chat_template_kwargs` and `add_generation_prompt` control
+conversation rendering; `add_generation_prompt` defaults to false.
+
+```json
+{
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "Describe this image."},
+      {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+    ]
+  }]
+}
+```
+
+An `input` object with `content` is treated as one user message. A batch can mix
+these content objects and text strings. Supported media depend on the loaded
+Rust model processor, as with chat. Precomputed image embeddings are not accepted.
+`truncate_prompt_tokens` is rejected for media inputs to preserve media positions.
+
+Batched chat conversations, IOProcessor plugins, composite outputs,
 padding, non-float32 output dtypes and binary HTTP responses are not supported.
 Unsupported request options return an error rather than being silently ignored.
 
@@ -224,3 +246,29 @@ supported yet.
 
 For bi-encoder 1:N scoring, the query is encoded once and its embedding is
 reused across documents. Usage still counts the query tokens for every pair.
+
+Both scoring endpoints also accept `{"content": [...]}` on either side, with
+the same image, video and audio URL/content parts as chat. Document batches can
+mix strings and content objects. Rerank echoes structured documents in
+`document.multi_modal`.
+
+Bi-encoders tokenize each side independently and reuse query preprocessing and
+embeddings for 1:N requests. Cross-encoders apply the tokenizer's pair template
+before expanding media placeholders; the query/document token-type boundary
+is adjusted to the expanded tokens. Models requiring a scoring prompt template
+can use an explicit `chat_template`, with `query` and `document` message roles,
+plus `chat_template_kwargs` or `instruction`. This template option applies to
+cross-encoders. Model-specific scoring templates are not selected automatically.
+Multimodal scoring also rejects `truncate_prompt_tokens`.
+
+```json
+{
+  "queries": "A red car",
+  "documents": [{
+    "content": [{
+      "type": "image_url",
+      "image_url": {"url": "https://example.com/car.png"}
+    }]
+  }]
+}
+```

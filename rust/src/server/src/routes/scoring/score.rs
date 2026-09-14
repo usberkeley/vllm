@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{ScoreInput, ScoredPairs, ScoringParams, prepare_pairs, run_pairs};
+use super::{ScoreInput, ScoredPairs, ScoringParams, run_pairs};
 use crate::routes::openai::utils::types::{Normalizable, Usage};
 use crate::routes::openai::utils::validated_json::ValidatedJson;
 use crate::state::AppState;
@@ -66,13 +66,16 @@ pub async fn score(
     let lora_resolution = state.resolve_model_with_loras(requested_model).await;
     let ctx = resolve_request_context(&headers, body.common.request_id.as_deref());
 
-    let prepared = match prepare_pairs(
+    let prepared = match super::multimodal::prepare(
         body.common,
-        body.data_1.into_prompts(),
-        body.data_2.into_prompts(),
+        body.data_1.into_items(),
+        body.data_2.into_items(),
         &lora_resolution,
         ctx,
-    ) {
+        &state.chat,
+    )
+    .await
+    {
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
     };
@@ -104,7 +107,7 @@ fn build_response(scored: ScoredPairs) -> ScoreResponse {
 
 #[cfg(test)]
 mod tests {
-    use vllm_text::Prompt;
+    use super::super::ScoreItem;
 
     use super::*;
 
@@ -121,12 +124,12 @@ mod tests {
             let request: ScoreRequest =
                 serde_json::from_str(body).unwrap_or_else(|error| panic!("{body}: {error}"));
             assert_eq!(
-                request.data_1.into_prompts(),
-                vec![Prompt::Text("q".into())]
+                request.data_1.into_items(),
+                vec![ScoreItem::Text("q".into())]
             );
             assert_eq!(
-                request.data_2.into_prompts(),
-                vec![Prompt::Text("d1".into()), Prompt::Text("d2".into())],
+                request.data_2.into_items(),
+                vec![ScoreItem::Text("d1".into()), ScoreItem::Text("d2".into())],
                 "{body}"
             );
         }
@@ -162,10 +165,10 @@ mod tests {
             serde_json::from_str(r#"{"text_1": [1, 2], "text_2": [[3], [4]]}"#).unwrap();
 
         assert_eq!(
-            (request.data_1.into_prompts(), request.data_2.into_prompts()),
+            (request.data_1.into_items(), request.data_2.into_items()),
             (
-                vec![Prompt::TokenIds(vec![1, 2])],
-                vec![Prompt::TokenIds(vec![3]), Prompt::TokenIds(vec![4])]
+                vec![ScoreItem::TokenIds(vec![1, 2])],
+                vec![ScoreItem::TokenIds(vec![3]), ScoreItem::TokenIds(vec![4])]
             )
         );
     }

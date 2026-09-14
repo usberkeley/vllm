@@ -12,6 +12,7 @@
 //! Original Python package:
 //! <https://github.com/vllm-project/vllm/blob/6ec92bcbc8/vllm/entrypoints/pooling/scoring/>
 
+mod multimodal;
 mod rerank;
 mod score;
 
@@ -32,6 +33,11 @@ use crate::utils::ResolvedRequestContext;
 /// <https://github.com/vllm-project/vllm/blob/6ec92bcbc8/vllm/entrypoints/pooling/scoring/protocol.py>
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub(crate) struct ScoringParams {
+    /// Explicit query/document template for cross-encoder models.
+    pub chat_template: Option<String>,
+    #[serde(default)]
+    pub chat_template_kwargs: std::collections::HashMap<String, serde_json::Value>,
+    pub instruction: Option<String>,
     /// ID of the model to use. An omitted or empty value selects the default.
     pub model: Option<String>,
     /// Whether to apply activation to pooler outputs. `None` uses the pooler's
@@ -65,15 +71,31 @@ pub(crate) enum ScoreInput {
     TokenIdBatch(Vec<Vec<u32>>),
     Text(String),
     TextBatch(Vec<String>),
+    Content {
+        content: Vec<crate::routes::openai::utils::types::ContentPart>,
+    },
+    MixedBatch(Vec<ScoreItem>),
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ScoreItem {
+    Text(String),
+    TokenIds(Vec<u32>),
+    Content {
+        content: Vec<crate::routes::openai::utils::types::ContentPart>,
+    },
 }
 
 impl ScoreInput {
-    fn into_prompts(self) -> Vec<Prompt> {
+    fn into_items(self) -> Vec<ScoreItem> {
         match self {
-            Self::TokenIds(token_ids) => vec![Prompt::TokenIds(token_ids)],
-            Self::TokenIdBatch(batch) => batch.into_iter().map(Prompt::TokenIds).collect(),
-            Self::Text(text) => vec![Prompt::Text(text)],
-            Self::TextBatch(batch) => batch.into_iter().map(Prompt::Text).collect(),
+            Self::Text(text) => vec![ScoreItem::Text(text)],
+            Self::TextBatch(batch) => batch.into_iter().map(ScoreItem::Text).collect(),
+            Self::TokenIds(ids) => vec![ScoreItem::TokenIds(ids)],
+            Self::TokenIdBatch(batch) => batch.into_iter().map(ScoreItem::TokenIds).collect(),
+            Self::Content { content } => vec![ScoreItem::Content { content }],
+            Self::MixedBatch(batch) => batch,
         }
     }
 }
@@ -83,6 +105,7 @@ struct PreparedRequest {
     response_id: String,
     response_model: String,
     request: vllm_text::ScoreRequest<Vec<Prompt>>,
+    encoded: Option<multimodal::EncodedScores>,
 }
 
 /// One scored pair, keyed by its position in the request.
@@ -188,6 +211,7 @@ fn prepare_pairs(
         response_id,
         response_model,
         request,
+        encoded: None,
     })
 }
 
@@ -196,10 +220,19 @@ async fn run_pairs(
     text: &vllm_text::TextLlm,
     prepared: PreparedRequest,
 ) -> Result<ScoredPairs, ApiError> {
-    let outputs = text
-        .score_batch(prepared.request)
-        .await
-        .map_err(|error| text_submit_error("failed to submit score request", error))?;
+    let outputs = match prepared.encoded {
+        Some(encoded) => {
+            text.score_encoded_batch(
+                prepared.response_id.clone(),
+                encoded.mode,
+                encoded.n_queries,
+                encoded.requests,
+            )
+            .await
+        }
+        None => text.score_batch(prepared.request).await,
+    }
+    .map_err(|error| text_submit_error("failed to submit score request", error))?;
     let scores = outputs
         .into_iter()
         .enumerate()

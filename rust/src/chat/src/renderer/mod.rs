@@ -42,6 +42,18 @@ pub trait ChatRenderer: Send + Sync {
     /// Render one chat request into the text prompt submitted to the text
     /// backend.
     fn render(&self, request: &ChatRequest) -> Result<RenderedPrompt>;
+
+    /// Render an explicit scoring template with query/document roles.
+    fn render_score(
+        &self,
+        _query: &crate::ChatContent,
+        _document: &crate::ChatContent,
+        _options: &crate::ChatOptions,
+    ) -> Result<RenderedPrompt> {
+        Err(crate::Error::ChatTemplate(
+            "this renderer does not support scoring templates".into(),
+        ))
+    }
 }
 
 /// Shared trait-object form of [`ChatRenderer`].

@@ -345,7 +345,7 @@ impl TextRequestProcessor {
 ///
 /// Original Python equivalent:
 /// <https://github.com/vllm-project/vllm/blob/6ec92bcbc8/vllm/entrypoints/pooling/scoring/io_processor.py#L53-L84>
-fn truncated_boundary(
+pub(crate) fn truncated_boundary(
     boundary: usize,
     original_len: usize,
     truncated_len: usize,
@@ -358,6 +358,57 @@ fn truncated_boundary(
 }
 
 impl TextLlm {
+    /// Score preprocessed pooling inputs, reusing each bi-encoder query once.
+    ///
+    /// Bi-encoder inputs are ordered as queries followed by documents;
+    /// cross-encoder inputs are already paired and use `n_queries = 0`.
+    pub async fn score_encoded_batch(
+        &self,
+        request_id: String,
+        mode: ScoreMode,
+        n_queries: usize,
+        requests: Vec<crate::TextEncodeRequest>,
+    ) -> Result<Vec<ScoreOutput>> {
+        let valid = match mode {
+            ScoreMode::BiEncoder => {
+                n_queries > 0
+                    && requests.len() > n_queries
+                    && (n_queries == 1 || requests.len() - n_queries == n_queries)
+            }
+            ScoreMode::CrossEncoder => n_queries == 0 && !requests.is_empty(),
+        };
+        if !valid {
+            return Err(ScoreError::InvalidInputLengths.into());
+        }
+        let outputs = self.encode_batch(requests).await?;
+        match mode {
+            ScoreMode::BiEncoder => Ok(outputs[n_queries..]
+                .iter()
+                .enumerate()
+                .map(|(index, document)| {
+                    self.bi_encoder_output(
+                        format!("{request_id}-{index}"),
+                        &outputs[if n_queries == 1 { 0 } else { index }],
+                        document,
+                    )
+                })
+                .collect()),
+            ScoreMode::CrossEncoder => outputs
+                .into_iter()
+                .enumerate()
+                .map(|(index, output)| {
+                    let id = format!("{request_id}-{index}");
+                    Ok(ScoreOutput {
+                        score: scalar_score(&id, &output)?,
+                        request_id: id,
+                        prompt_token_ids: output.prompt_token_ids,
+                        cached_token_count: output.cached_token_count,
+                    })
+                })
+                .collect(),
+        }
+    }
+
     /// Score a batch, encoding a shared bi-encoder query only once.
     /// Results retain document order and account for prompt tokens per pair.
     /// Both sides must be nonempty, with one query or equal input counts.
@@ -608,6 +659,7 @@ mod tests {
                     99,
                     257,
                 ],
+                mm_features: None,
                 task: Classify,
                 pooling_params: PoolingParams {
                     use_activation: None,
