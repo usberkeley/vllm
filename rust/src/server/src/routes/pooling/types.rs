@@ -3,32 +3,13 @@
 
 use crate::error::{ApiError, bail_invalid_request};
 use crate::routes::openai::utils::types::Normalizable;
+use crate::routes::pooling_input::{ChatInputOptions, Input};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use validator::Validate;
 use vllm_llm::PoolingTask;
-use vllm_text::{Prompt, TruncationSide};
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum Input {
-    Text(String),
-    TextBatch(Vec<String>),
-    TokenIds(Vec<u32>),
-    TokenIdBatch(Vec<Vec<u32>>),
-}
-
-impl Input {
-    pub(super) fn into_prompts(self) -> Vec<Prompt> {
-        match self {
-            Self::Text(text) => vec![Prompt::Text(text)],
-            Self::TextBatch(batch) => batch.into_iter().map(Prompt::Text).collect(),
-            Self::TokenIds(token_ids) => vec![Prompt::TokenIds(token_ids)],
-            Self::TokenIdBatch(batch) => batch.into_iter().map(Prompt::TokenIds).collect(),
-        }
-    }
-}
+use vllm_text::TruncationSide;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -41,7 +22,9 @@ pub(crate) enum EncodingFormat {
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub(crate) struct PoolingRequest {
     pub model: Option<String>,
-    pub input: Input,
+    pub input: Option<Input>,
+    #[serde(flatten)]
+    pub chat: ChatInputOptions,
     pub task: Option<PoolingTask>,
     pub dimensions: Option<u32>,
     pub use_activation: Option<bool>,

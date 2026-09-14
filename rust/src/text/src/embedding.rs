@@ -56,6 +56,9 @@ pub struct EmbeddingRequest {
     pub request_id: String,
     /// Prompt text or pre-tokenized prompt IDs.
     pub prompt: Prompt,
+    /// Preprocessed media attached to an already-tokenized prompt.
+    #[serde(default)]
+    pub mm_features: Option<vllm_engine_core_client::protocol::multimodal::MmFeatures>,
     /// Embedding parameters forwarded to engine-core for model-aware resolution.
     pub params: EmbeddingParams,
     /// Optional typed prompt-truncation policy.
@@ -88,6 +91,7 @@ impl EmbeddingRequest {
         Self {
             request_id: "test-embedding".to_string(),
             prompt: Prompt::Text("test".to_string()),
+            mm_features: None,
             params: EmbeddingParams::default(),
             prompt_truncation: None,
             add_special_tokens: true,
@@ -158,6 +162,7 @@ impl TextRequestProcessor {
         self.prepare_encode(TextEncodeRequest {
             request_id: request.request_id,
             prompt: request.prompt,
+            mm_features: request.mm_features,
             add_special_tokens: request.add_special_tokens,
             prompt_truncation: request.prompt_truncation,
             task: PoolingTask::Embed,
@@ -241,6 +246,18 @@ mod tests {
     }
 
     #[test]
+    fn multimodal_pooling_rejects_truncation_that_could_split_media() {
+        let mut input = request(Prompt::TokenIds(vec![1, 2]));
+        input.mm_features = Some(Vec::new());
+        input.prompt_truncation =
+            Some(PromptTruncation::from_wire(1, crate::TruncationSide::Right).unwrap());
+        assert!(matches!(
+            processor().prepare_embedding(input),
+            Err(Error::TruncateUnsupportedWithMultimodal)
+        ));
+    }
+
+    #[test]
     fn preparation_tokenizes_and_forwards_unset_pooling_params() {
         let prepared =
             processor().prepare_embedding(request(Prompt::Text("abc".to_string()))).unwrap();
@@ -254,6 +271,7 @@ mod tests {
                     98,
                     99,
                 ],
+                mm_features: None,
                 task: Embed,
                 pooling_params: PoolingParams {
                     use_activation: None,
@@ -390,6 +408,7 @@ mod tests {
         expect![[r#"
             EmbeddingOutput {
                 request_id: "external-id",
+                mm_features: None,
                 prompt_token_ids: [
                     1,
                     2,

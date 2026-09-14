@@ -44,6 +44,7 @@ fn build_request() -> EncodeRequest {
     EncodeRequest {
         request_id: format!("rust-embedding-{}", uuid::Uuid::new_v4()),
         prompt_token_ids: PROMPT_TOKEN_IDS.to_vec(),
+        mm_features: None,
         task: PoolingTask::Embed,
         pooling_params: PoolingParams::default(),
         arrival_time: None,

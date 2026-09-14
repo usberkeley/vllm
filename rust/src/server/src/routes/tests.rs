@@ -719,6 +719,25 @@ async fn test_pooling_app_with_outputs(
     order: PoolingOutputOrder,
     inspect: impl Fn(&EngineCoreRequest) + Send + 'static,
 ) -> (axum::Router, MockEngineTask) {
+    test_pooling_app_with_backend(
+        engine_id,
+        tasks,
+        outputs,
+        order,
+        inspect,
+        Arc::new(FakeChatBackend::new()),
+    )
+    .await
+}
+
+async fn test_pooling_app_with_backend(
+    engine_id: &'static str,
+    tasks: Vec<PoolingTask>,
+    outputs: Vec<WireTensor>,
+    order: PoolingOutputOrder,
+    inspect: impl Fn(&EngineCoreRequest) + Send + 'static,
+    backend: Arc<dyn ChatTextBackend>,
+) -> (axum::Router, MockEngineTask) {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
 
@@ -806,7 +825,7 @@ async fn test_pooling_app_with_outputs(
     )
     .await
     .expect("connect client");
-    let chat = ChatLlm::from_shared_backend(test_llm(client), Arc::new(FakeChatBackend::new()));
+    let chat = ChatLlm::from_shared_backend(test_llm(client), backend);
 
     (
         build_router(Arc::new(AppState::new(
@@ -7769,4 +7788,52 @@ async fn profile_routes_are_hidden_when_profiling_is_disabled() {
     }
 
     engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pooling_endpoints_forward_preprocessed_images_to_engine() {
+    for uri in ["/v1/embeddings", "/pooling", "/classify"] {
+        let task = if uri == "/classify" {
+            PoolingTask::Classify
+        } else {
+            PoolingTask::Embed
+        };
+        let (mut app, engine) = test_pooling_app_with_backend(
+            "pooling-image",
+            vec![task],
+            vec![WireTensor::from_f32(vec![2], vec![0.25, 0.75]).unwrap()],
+            PoolingOutputOrder::Immediate,
+            |request| {
+                assert!(request.sampling_params.is_none());
+                let features = request.mm_features.as_ref().expect("media features");
+                assert_eq!(features.len(), 1);
+                let feature = &features[0];
+                assert_eq!(feature.modality, "image");
+                assert!(feature.data.is_some());
+                assert!(feature.mm_position.length > 0);
+                let ids = request.prompt_token_ids.as_ref().unwrap();
+                assert!(feature.mm_position.offset + feature.mm_position.length <= ids.len());
+                assert!(
+                    ids[feature.mm_position.offset
+                        ..feature.mm_position.offset + feature.mm_position.length]
+                        .iter()
+                        .all(|&id| id == 151655)
+                );
+            },
+            Arc::new(FakeChatBackend::with_multimodal_model_info(
+                qwen_multimodal_model_info(),
+            )),
+        )
+        .await;
+        let (status, body) = post_pooling_json(&mut app, uri, json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}
+            ]}]
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+        engine.finish().await;
+    }
 }

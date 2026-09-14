@@ -29,6 +29,7 @@ use zeromq::{DealerSocket, PushSocket, ZmqMessage};
 fn sample_request() -> EncodeRequest {
     EncodeRequest {
         request_id: "embed-1".to_string(),
+        mm_features: None,
         prompt_token_ids: vec![11, 22],
         task: PoolingTask::Embed,
         pooling_params: PoolingParams {

@@ -44,7 +44,7 @@ pub async fn embeddings(
     let requested_model = body.model.as_deref().filter(|model| !model.is_empty());
     let lora_resolution = state.resolve_model_with_loras(requested_model).await;
     let ctx = resolve_request_context(&headers, body.request_id.as_deref());
-    let prepared = match prepare_request(body, &lora_resolution, ctx) {
+    let prepared = match prepare_request(body, &lora_resolution, ctx, &state.chat).await {
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
     };
@@ -55,10 +55,11 @@ pub async fn embeddings(
     }
 }
 
-fn prepare_request(
+async fn prepare_request(
     request: EmbeddingRequest,
     lora_resolution: &LoraModelResolution,
     ctx: ResolvedRequestContext,
+    chat: &vllm_chat::ChatLlm,
 ) -> Result<PreparedRequest, ApiError> {
     validate_request(&request, &lora_resolution.model_names)?;
 
@@ -72,7 +73,15 @@ fn prepare_request(
         })
         .transpose()
         .map_err(|error| text_submit_error("invalid prompt truncation", error))?;
-    let prompts = request.input.into_prompts();
+    let prompts = request
+        .chat
+        .prepare(
+            request.input,
+            chat,
+            request.add_special_tokens,
+            request.truncate_prompt_tokens,
+        )
+        .await?;
     if prompts.is_empty() {
         bail_invalid_request!(param = "input", "input must not be empty.");
     }
@@ -93,7 +102,8 @@ fn prepare_request(
         .enumerate()
         .map(|(index, prompt)| vllm_text::EmbeddingRequest {
             request_id: format!("{response_id}-{index}"),
-            prompt,
+            prompt: prompt.prompt,
+            mm_features: prompt.mm_features,
             params: params.clone(),
             prompt_truncation,
             add_special_tokens: request.add_special_tokens,

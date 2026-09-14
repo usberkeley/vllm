@@ -14,6 +14,7 @@ use crate::{Prompt, PromptTruncation, Result, TextLlm, TextRequestProcessor};
 pub struct TextEncodeRequest {
     pub request_id: String,
     pub prompt: Prompt,
+    pub mm_features: Option<vllm_engine_core_client::protocol::multimodal::MmFeatures>,
     pub task: PoolingTask,
     pub pooling_params: PoolingParams,
     pub add_special_tokens: bool,
@@ -30,6 +31,12 @@ pub struct TextEncodeRequest {
 impl TextRequestProcessor {
     /// Tokenize and validate a pooling input without generation defaults.
     pub fn prepare_encode(&self, request: TextEncodeRequest) -> Result<EncodeRequest> {
+        if request.mm_features.is_some() && !matches!(request.prompt, Prompt::TokenIds(_)) {
+            return Err(crate::Error::MultimodalRequiresTokenIds);
+        }
+        if request.mm_features.is_some() && request.prompt_truncation.is_some() {
+            return Err(crate::Error::TruncateUnsupportedWithMultimodal);
+        }
         let prompt_token_ids = self.prepare_prompt_tokens(
             request.prompt,
             request.add_special_tokens,
@@ -40,6 +47,7 @@ impl TextRequestProcessor {
         Ok(EncodeRequest {
             request_id: request.request_id,
             prompt_token_ids,
+            mm_features: request.mm_features,
             task: request.task,
             pooling_params: request.pooling_params,
             arrival_time: request.arrival_time,

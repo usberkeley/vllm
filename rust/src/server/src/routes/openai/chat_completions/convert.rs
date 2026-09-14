@@ -321,7 +321,7 @@ pub(crate) fn convert_message(message: ChatMessage) -> Result<VllmChatMessage, A
 
 /// Convert the given OpenAI message content value into the internal format in
 /// `vllm-chat`.
-fn convert_content(content: MessageContent) -> Result<ChatContent, ApiError> {
+pub(crate) fn convert_content(content: MessageContent) -> Result<ChatContent, ApiError> {
     match content {
         MessageContent::Text(text) => Ok(ChatContent::Text(text)),
         MessageContent::Parts(parts) => parts

@@ -1,32 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use crate::routes::pooling_input::{ChatInputOptions, Input};
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-use vllm_text::{Prompt, TruncationSide};
+use vllm_text::TruncationSide;
 
 use crate::routes::openai::utils::types::{Normalizable, Usage, default_true};
-
-/// Text or token-ID input accepted by the OpenAI embeddings endpoint.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum EmbeddingInput {
-    TokenIds(Vec<u32>),
-    TokenIdBatch(Vec<Vec<u32>>),
-    Text(String),
-    TextBatch(Vec<String>),
-}
-
-impl EmbeddingInput {
-    pub(super) fn into_prompts(self) -> Vec<Prompt> {
-        match self {
-            Self::TokenIds(token_ids) => vec![Prompt::TokenIds(token_ids)],
-            Self::TokenIdBatch(batch) => batch.into_iter().map(Prompt::TokenIds).collect(),
-            Self::Text(text) => vec![Prompt::Text(text)],
-            Self::TextBatch(batch) => batch.into_iter().map(Prompt::Text).collect(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,7 +33,9 @@ pub(crate) struct EmbeddingRequest {
     /// ID of the model to use. An omitted or empty value selects the default.
     pub model: Option<String>,
     /// One text/token-ID prompt or a batch of homogeneous prompts.
-    pub input: EmbeddingInput,
+    pub input: Option<Input>,
+    #[serde(flatten)]
+    pub chat: ChatInputOptions,
     /// Response encoding. `float` returns JSON numbers; `base64` returns the
     /// requested float32 byte representation.
     #[serde(default)]

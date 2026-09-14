@@ -52,6 +52,7 @@ mod event;
 pub mod multimodal;
 mod output;
 mod parser;
+mod pooling;
 mod renderer;
 mod request;
 mod stream;

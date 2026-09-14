@@ -44,6 +44,8 @@ pub enum Error {
     InvalidTruncatePromptTokens { value: i64 },
     #[error("truncate_prompt_tokens is not supported for multimodal requests")]
     TruncateUnsupportedWithMultimodal,
+    #[error("preprocessed multimodal inputs require expanded token IDs")]
+    MultimodalRequiresTokenIds,
     #[error("invalid repetition detection params: {message}")]
     InvalidRepetitionDetection { message: String },
     #[error("text request stream `{request_id}` closed before terminal output")]
@@ -72,6 +74,7 @@ impl Error {
             | Self::TruncatePromptTokensExceedsBudget { .. }
             | Self::InvalidTruncatePromptTokens { .. }
             | Self::TruncateUnsupportedWithMultimodal
+            | Self::MultimodalRequiresTokenIds
             | Self::InvalidRepetitionDetection { .. }
             // An empty tokenized prompt detected later, at request prepare
             // time, surfaces through the transparent Llm wrapper.

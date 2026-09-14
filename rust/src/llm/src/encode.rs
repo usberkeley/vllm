@@ -59,6 +59,8 @@ pub struct EncodeRequest {
     pub request_id: String,
     /// Token IDs of the prompt.
     pub prompt_token_ids: Vec<u32>,
+    /// Preprocessed media and their positions in the expanded prompt.
+    pub mm_features: Option<vllm_engine_core_client::protocol::multimodal::MmFeatures>,
     /// The task used for pooling.
     pub task: PoolingTask,
     /// Pooling parameters forwarded to engine-core.
@@ -130,6 +132,7 @@ impl EncodeRequest {
         let Self {
             request_id,
             prompt_token_ids,
+            mm_features,
             task,
             pooling_params,
             arrival_time,
@@ -146,7 +149,7 @@ impl EncodeRequest {
             engine_request: EngineCoreRequest {
                 request_id: engine_request_id,
                 prompt_token_ids: Some(prompt_token_ids),
-                mm_features: None,
+                mm_features,
                 sampling_params: None,
                 pooling_params: Some(pooling_params.into_engine(task)),
                 arrival_time: arrival_time.unwrap_or_else(current_unix_timestamp_secs),
@@ -263,6 +266,7 @@ mod tests {
     fn sample_request() -> EncodeRequest {
         EncodeRequest {
             request_id: "embed-1".to_string(),
+            mm_features: None,
             prompt_token_ids: vec![11, 22],
             task: PoolingTask::Embed,
             pooling_params: PoolingParams {

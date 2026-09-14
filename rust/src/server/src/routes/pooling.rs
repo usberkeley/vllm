@@ -100,7 +100,15 @@ async fn prepare_request(
     }
     let add_special_tokens = body.add_special_tokens.unwrap_or(true);
     let ctx = resolve_request_context(headers, body.request_id.as_deref());
-    let prompts = body.input.into_prompts();
+    let prompts = body
+        .chat
+        .prepare(
+            body.input,
+            &state.chat,
+            add_special_tokens,
+            body.truncate_prompt_tokens,
+        )
+        .await?;
     if prompts.is_empty() {
         bail_invalid_request!(param = "input", "input must contain at least one prompt");
     }
@@ -164,7 +172,8 @@ async fn prepare_request(
         .into_iter()
         .enumerate()
         .map(|(index, prompt)| TextEncodeRequest {
-            prompt,
+            prompt: prompt.prompt,
+            mm_features: prompt.mm_features,
             add_special_tokens,
             prompt_truncation: truncation,
             request_id: format!("{id}-{index}"),
