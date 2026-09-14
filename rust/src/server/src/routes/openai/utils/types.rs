@@ -222,6 +222,10 @@ impl StreamResponseEnvelope {
     pub(crate) fn model(&self) -> &str {
         &self.model
     }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 /// Mirrors the Python vLLM `StreamOptions` class.
